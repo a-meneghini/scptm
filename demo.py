@@ -41,8 +41,15 @@ indices = np.concatenate([
 ])
 indices = rng.permutation(indices)
 
-DOCUMENTS  = [raw.data[i] for i in indices]
-TRUE_LABELS = raw.target[indices]
+raw_docs   = [raw.data[i] for i in indices]
+raw_labels = raw.target[indices]
+
+# Mirror the filter applied by prepare_corpus(apply_chunking=False):
+# documents whose stripped text is <= 10 chars are silently dropped.
+# Pre-filtering here keeps TRUE_LABELS aligned with the corpus.
+keep        = np.array([len(d.strip()) > 10 for d in raw_docs])
+DOCUMENTS   = [d for d, k in zip(raw_docs, keep) if k]
+TRUE_LABELS = raw_labels[keep]
 
 print(f"Corpus: {len(DOCUMENTS)} documents across {len(CATEGORIES)} categories")
 print(f"Categories: {', '.join(CATEGORIES)}\n")
