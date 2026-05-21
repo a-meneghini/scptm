@@ -1,0 +1,155 @@
+"""
+scptm/config.py
+---------------
+Central configuration dataclass for SCPTM.
+All hyper-parameters in one place — no scattered magic numbers.
+"""
+
+from dataclasses import dataclass, field
+from typing import Literal, Optional
+
+
+# Supported graph modes and their human-readable descriptions.
+GRAPH_MODES = {
+    "none":      "No syntactic graph — equivalent to CTM + KL annealing",
+    "no_syntax": "Doc-word edges only, no word-word edges",
+    "full_dep":  "All content dependency types (word-word)",
+    "filtered":  "Informative dependency types only (default)",
+}
+
+# Dependency relation sets used in 'filtered' and 'full_dep' modes.
+INFORMATIVE_DEP_TYPES: frozenset = frozenset({
+    "nsubj", "dobj", "amod", "nmod", "compound", "conj", "xcomp",
+})
+ALL_CONTENT_DEP_TYPES: frozenset = frozenset({
+    "nsubj", "nsubjpass", "dobj", "iobj", "amod", "nmod", "compound",
+    "conj", "xcomp", "ccomp", "advcl", "relcl", "appos", "attr",
+    "pobj", "advmod", "npadvmod",
+})
+
+
+@dataclass
+class SCPTMConfig:
+    """
+    All configuration parameters for SCPTM.
+
+    Parameters
+    ----------
+    num_topics : int
+        Number of latent topics to discover.
+    epochs : int
+        Training epochs.
+    lr : float
+        AdamW learning rate.
+    batch_size : int
+        Documents per gradient step.
+    hidden_channels : int
+        Hidden dimension of the GNN / MLP encoder.
+        NOTE: mu/logvar layers receive hidden_channels * 2 (from 2-head GAT).
+    min_df : int
+        Minimum document frequency for vocabulary inclusion.
+    max_features : int
+        Maximum vocabulary size.
+    graph_mode : str
+        One of {"none", "no_syntax", "full_dep", "filtered"}.
+    lang : str
+        Language code: "eng" or "ita".
+    kl_max : float
+        Maximum KL weight after annealing.
+    kl_warmup_epochs : int
+        Epochs to ramp KL weight from 0 to kl_max.
+    kl_strategy : str
+        Annealing schedule: "linear", "cyclical", or "constant".
+    free_bits : float
+        Minimum KL per dimension (prevents posterior collapse).
+    n_mc_samples : int
+        Monte Carlo samples for uncertainty estimation at inference.
+    max_ctx_occurrences : int
+        Max document embeddings stored per word for contextual beta.
+    beta_refresh_epochs : int
+        Recompute contextual beta every N epochs.
+    metrics_every_n_epochs : int
+        Compute NPMI and diversity every N epochs.
+    topic_diversity_weight : float
+        Strength of cosine-repulsion penalty between topic embeddings.
+        Set to 0.0 to disable.
+    bow_normalization : str
+        BoW normalisation before reconstruction loss:
+        "none"  — raw counts,
+        "tf"    — divide by doc length,
+        "log1p" — log(1 + count).
+    keyword_method : str
+        Keyword ranking method: "cosine" (default, beta/cosine similarity) or
+        "ctfidf" (class-based TF-IDF, treats each topic as a document class).
+    use_mixed_precision : bool
+        Enable torch.cuda.amp (GPU only).
+    use_neighbor_sampling : bool
+        Use PyG NeighborLoader for mini-batch GNN training.
+    apply_chunking : bool
+        Split long documents into overlapping chunks.
+    max_chunk_chars : int
+        Maximum characters per chunk.
+    random_state : int
+        Seed for UMAP and numpy random operations.
+    """
+
+    # ---- Model architecture ----
+    num_topics: int = 10
+    hidden_channels: int = 64
+
+    # ---- Corpus & vocabulary ----
+    min_df: int = 5
+    max_features: int = 15_000
+    lang: Literal["eng", "ita"] = "eng"
+    apply_chunking: bool = True
+    max_chunk_chars: int = 800
+
+    # ---- Training ----
+    epochs: int = 50
+    lr: float = 5e-3
+    batch_size: int = 256
+    kl_max: float = 1.0
+    kl_warmup_epochs: int = 20
+    kl_strategy: Literal["linear", "cyclical", "constant"] = "linear"
+    free_bits: float = 0.0
+    n_mc_samples: int = 1
+
+    # ---- Graph ----
+    graph_mode: Literal["none", "no_syntax", "full_dep", "filtered"] = "filtered"
+
+    # ---- Contextual beta ----
+    max_ctx_occurrences: int = 50
+    beta_refresh_epochs: int = 5
+
+    # ---- Regularisation ----
+    topic_diversity_weight: float = 0.1   # FIX: repulsion between topic embeddings
+
+    # ---- BoW normalisation ----
+    bow_normalization: Literal["none", "tf", "log1p"] = "tf"   # FIX: bias vs doc length
+
+    # ---- Keyword extraction ----
+    keyword_method: Literal["cosine", "ctfidf"] = "cosine"
+
+    # ---- Logging ----
+    metrics_every_n_epochs: int = 10
+
+    # ---- Hardware ----
+    use_mixed_precision: bool = True
+    use_neighbor_sampling: bool = False
+
+    # ---- Reproducibility ----
+    random_state: int = 42
+
+    def __post_init__(self):
+        assert self.graph_mode in GRAPH_MODES, (
+            f"graph_mode must be one of {list(GRAPH_MODES)}, got '{self.graph_mode}'"
+        )
+        assert self.kl_strategy in ("linear", "cyclical", "constant"), (
+            f"kl_strategy must be linear/cyclical/constant, got '{self.kl_strategy}'"
+        )
+        assert self.bow_normalization in ("none", "tf", "log1p"), (
+            f"bow_normalization must be none/tf/log1p, got '{self.bow_normalization}'"
+        )
+        assert self.keyword_method in ("cosine", "ctfidf"), (
+            f"keyword_method must be cosine/ctfidf, got '{self.keyword_method}'"
+        )

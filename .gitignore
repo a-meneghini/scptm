@@ -1,0 +1,28 @@
+# macOS
+.DS_Store
+
+# Editor / Claude Code state
+.claude/
+
+# Build artifacts and distributions
+*.zip
+*.egg-info/
+dist/
+build/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Model checkpoints and cache files
+*.pkl
+*.pt
+*.pth
+
+# Runtime outputs
+*.png
+training_history.png
+semantic_space_2d.png
+
+# Jupyter
+.ipynb_checkpoints/

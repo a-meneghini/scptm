@@ -1,0 +1,426 @@
+"""
+scptm/graph.py
+--------------
+Corpus preprocessing, vocabulary building, and heterogeneous graph construction.
+"""
+
+import os
+import pickle
+import warnings
+from collections import defaultdict
+from pathlib import Path
+from typing import List, Optional, Tuple, Union
+
+import numpy as np
+import pandas as pd
+import torch
+from sklearn.feature_extraction.text import CountVectorizer
+from torch_geometric.data import HeteroData
+from tqdm import tqdm
+
+from .config import (
+    ALL_CONTENT_DEP_TYPES,
+    GRAPH_MODES,
+    INFORMATIVE_DEP_TYPES,
+    SCPTMConfig,
+)
+
+
+# ---------------------------------------------------------------------------
+# Corpus helpers
+# ---------------------------------------------------------------------------
+
+def prepare_corpus(
+    source,
+    source_type: str = "folder",
+    text_col: Optional[str] = None,
+    apply_chunking: bool = True,
+    max_chunk_chars: int = 800,
+) -> List[str]:
+    """
+    Load and optionally chunk a text corpus.
+
+    Parameters
+    ----------
+    source : str | pd.DataFrame
+        Path to a folder of .txt files, or a DataFrame.
+    source_type : str
+        "folder" or "dataframe".
+    text_col : str | None
+        Column name when source_type == "dataframe".
+    apply_chunking : bool
+        Split long documents into shorter segments.
+    max_chunk_chars : int
+        Maximum characters per chunk.
+
+    Returns
+    -------
+    List[str]
+        Processed document strings.
+    """
+    raw: List[str] = []
+
+    if source_type == "folder":
+        if not os.path.exists(source):
+            raise FileNotFoundError(f"Directory '{source}' not found.")
+        for fn in sorted(os.listdir(source)):
+            if fn.endswith(".txt"):
+                with open(os.path.join(source, fn), "r", encoding="utf-8", errors="ignore") as f:
+                    raw.append(f.read().strip())
+
+    elif source_type == "dataframe":
+        if not isinstance(source, pd.DataFrame) or text_col not in source.columns:
+            raise ValueError("Provide a valid DataFrame and the text column name.")
+        raw = source[text_col].dropna().astype(str).tolist()
+
+    elif source_type == "list":
+        if not isinstance(source, list):
+            raise ValueError("source must be a list of strings when source_type='list'.")
+        raw = [str(s) for s in source]
+
+    else:
+        raise ValueError("source_type must be 'folder', 'dataframe', or 'list'.")
+
+    print(f"Loaded {len(raw)} raw documents.")
+
+    if not apply_chunking:
+        docs = [" ".join(t.split()) for t in raw if len(t.strip()) > 10]
+        return docs
+
+    docs: List[str] = []
+    for text in raw:
+        clean = " ".join(text.split())
+        sentences = clean.split(". ")
+        chunk = ""
+        for sent in sentences:
+            sent = sent.strip()
+            if not sent:
+                continue
+            if len(chunk) + len(sent) > max_chunk_chars and chunk:
+                docs.append(chunk + ".")
+                chunk = sent
+            else:
+                chunk = chunk + ". " + sent if chunk else sent
+        if len(chunk) > 50:
+            docs.append(chunk + ".")
+
+    print(f"Final corpus: {len(docs)} segments.")
+    return docs
+
+
+# ---------------------------------------------------------------------------
+# Contextual embeddings per word
+# ---------------------------------------------------------------------------
+
+def collect_contextual_embeddings(
+    documents: List[str],
+    nlp_model,
+    sbert_model,
+    vocab: dict,
+    max_occurrences_per_word: int = 50,
+) -> dict:
+    """
+    For each vocabulary word, collect up to `max_occurrences_per_word` SBERT
+    document embeddings from contexts where the word appears.
+
+    Returns
+    -------
+    dict
+        word -> torch.Tensor of shape (N, emb_dim)
+    """
+    print("Collecting contextual embeddings (REV-A)...")
+    ctx_embs = defaultdict(list)
+
+    for text in tqdm(documents, desc="Contextual embeddings"):
+        doc_vec = sbert_model.encode(text)
+        spacy_doc = nlp_model(text)
+        seen = set()
+        for token in spacy_doc:
+            if token.is_stop or not token.is_alpha or len(token.lemma_) <= 2:
+                continue
+            lemma = token.lemma_.lower()
+            if lemma not in vocab or lemma in seen:
+                continue
+            seen.add(lemma)
+            ctx_embs[lemma].append(doc_vec)
+
+    # Subsample to max_occurrences_per_word
+    rng = np.random.default_rng(42)
+    for w in ctx_embs:
+        if len(ctx_embs[w]) > max_occurrences_per_word:
+            idx = rng.choice(len(ctx_embs[w]), max_occurrences_per_word, replace=False)
+            ctx_embs[w] = [ctx_embs[w][i] for i in idx]
+
+    ctx_tensor = {
+        w: torch.tensor(np.stack(vecs), dtype=torch.float32)
+        for w, vecs in ctx_embs.items()
+    }
+    coverage = len(ctx_tensor) / max(len(vocab), 1)
+    print(f"  Vocabulary coverage: {coverage:.1%} ({len(ctx_tensor)}/{len(vocab)} lemmas)")
+    return ctx_tensor
+
+
+# ---------------------------------------------------------------------------
+# Parse cache (edge list + vocabulary) — avoid re-running spaCy on reload
+# ---------------------------------------------------------------------------
+
+def _save_parse_cache(
+    path: Union[str, Path],
+    vocab_arr: np.ndarray,
+    bow_sparse,
+    doc_word_src: list,
+    doc_word_dst: list,
+    word_word_src: list,
+    word_word_dst: list,
+    n_docs: int,
+) -> None:
+    """Persist the NLP-heavy outputs so they can be reused across runs."""
+    cache = {
+        "_n_docs":       n_docs,
+        "vocab_arr":     vocab_arr,
+        "bow_sparse":    bow_sparse,
+        "doc_word_src":  doc_word_src,
+        "doc_word_dst":  doc_word_dst,
+        "word_word_src": word_word_src,
+        "word_word_dst": word_word_dst,
+    }
+    with open(path, "wb") as f:
+        pickle.dump(cache, f)
+    print(f"  [EdgeCache] Saved to '{path}'")
+
+
+def _load_parse_cache(path: Union[str, Path], n_docs: int):
+    """
+    Load a previously saved parse cache.
+
+    Returns the cache dict if the file exists and the corpus size matches,
+    otherwise returns None (triggering a fresh build).
+    """
+    if not os.path.exists(path):
+        return None
+    with open(path, "rb") as f:
+        cache = pickle.load(f)
+    if cache.get("_n_docs") != n_docs:
+        warnings.warn(
+            f"[EdgeCache] Corpus size changed ({cache['_n_docs']} → {n_docs}). "
+            "Ignoring stale cache and rebuilding."
+        )
+        return None
+    print(f"  [EdgeCache] Loaded from '{path}' — skipping spaCy parsing.")
+    return cache
+
+
+# ---------------------------------------------------------------------------
+# Memory estimation
+# ---------------------------------------------------------------------------
+
+def estimate_graph_memory(
+    n_docs: int,
+    vocab_size: int,
+    n_edges_doc_word: int,
+    n_edges_word_word: int,
+    emb_dim: int = 384,
+    dtype_bytes: int = 4,
+) -> dict:
+    """Print and return a GPU memory estimate for the heterogeneous graph."""
+    node_mem = (n_docs + vocab_size) * emb_dim * dtype_bytes
+    edge_mem = (n_edges_doc_word + n_edges_word_word) * 2 * dtype_bytes
+    activation_mem = node_mem * 3
+    gradient_mem = node_mem * 2
+    total_bytes = node_mem + edge_mem + activation_mem + gradient_mem
+    total_gb = total_bytes / (1024 ** 3)
+    report = {
+        "node_features_MB":   round(node_mem / 1024**2, 1),
+        "edge_index_MB":      round(edge_mem / 1024**2, 1),
+        "activations_MB":     round(activation_mem / 1024**2, 1),
+        "gradients_MB":       round(gradient_mem / 1024**2, 1),
+        "total_estimated_GB": round(total_gb, 2),
+    }
+    print("\n[Memory estimate]")
+    for k, v in report.items():
+        print(f"  {k:25s}: {v}")
+    if total_gb > 20:
+        print("  CRITICAL WARNING: >20 GB estimated. Use NeighborLoader or GraphSAINT.")
+    elif total_gb > 8:
+        print("  WARNING: >8 GB estimated. Enable mixed precision + gradient checkpointing.")
+    return report
+
+
+# ---------------------------------------------------------------------------
+# Main graph builder
+# ---------------------------------------------------------------------------
+
+def build_hetero_graph(
+    documents: List[str],
+    sbert_model,
+    nlp_model,
+    stop_words,
+    cfg: SCPTMConfig,
+    edge_cache_path: Optional[Union[str, Path]] = None,
+) -> Tuple[HeteroData, List[str], object, int, int]:
+    """
+    Build a heterogeneous PyG graph over documents and vocabulary words.
+
+    Node types : "doc", "word"
+    Edge types : ("doc","contains","word"),
+                 ("word","rev_contains","doc"),
+                 ("word","relates","word")
+
+    Returns
+    -------
+    data       : HeteroData
+    vocab_list : list of vocabulary strings
+    bow_sparse : CountVectorizer sparse BoW matrix (n_docs x vocab_size)
+    n_dw       : number of doc-word edges
+    n_ww       : number of word-word edges
+    """
+    graph_mode = cfg.graph_mode
+    assert graph_mode in GRAPH_MODES
+
+    print(f"\n[Graph] Mode: '{graph_mode}' — {GRAPH_MODES[graph_mode]}")
+
+    # ---- Try loading pre-cached parse results ----
+    _cache = None
+    if edge_cache_path is not None:
+        _cache = _load_parse_cache(edge_cache_path, len(documents))
+
+    if _cache is not None:
+        # Cache hit: restore vocabulary and edge lists without re-parsing
+        vocab_arr  = _cache["vocab_arr"]
+        bow_sparse = _cache["bow_sparse"]
+        vocab      = {word: idx for idx, word in enumerate(vocab_arr)}
+        doc_word_src  = _cache["doc_word_src"]
+        doc_word_dst  = _cache["doc_word_dst"]
+        word_word_src = _cache["word_word_src"]
+        word_word_dst = _cache["word_word_dst"]
+        print(f"  Vocabulary: {len(vocab)} unique lemmas (from cache).")
+        _cache_was_used = True
+    else:
+        # ---- 1. Build vocabulary on lemmas ----
+        print("1/5  Building lemma vocabulary...")
+        lemma_docs = []
+        for text in tqdm(documents, desc="Lemmatisation"):
+            doc = nlp_model(text)
+            lemmas = [
+                t.lemma_.lower()
+                for t in doc
+                if not t.is_stop and t.is_alpha and len(t.lemma_) > 2
+            ]
+            lemma_docs.append(" ".join(lemmas))
+
+        vectorizer = CountVectorizer(
+            stop_words=stop_words,
+            min_df=cfg.min_df,
+            max_features=cfg.max_features,
+            token_pattern=r"(?u)\b[a-zA-Z][a-zA-Z]+\b",
+        )
+        bow_sparse = vectorizer.fit_transform(lemma_docs)
+        vocab_arr  = vectorizer.get_feature_names_out()
+        vocab      = {word: idx for idx, word in enumerate(vocab_arr)}
+        print(f"  Vocabulary: {len(vocab)} unique lemmas.")
+        _cache_was_used = False
+
+    # ---- 2. Document embeddings ----
+    print("2/5  Encoding documents (SBERT)...")
+    doc_embs = sbert_model.encode(documents, show_progress_bar=True)
+    data = HeteroData()
+    data["doc"].x = torch.tensor(doc_embs, dtype=torch.float)
+
+    # ---- None mode: no edges ----
+    if graph_mode == "none":
+        print("  MODE 'none': no edges generated (CTM-like baseline).")
+        data["word"].x = torch.tensor(
+            sbert_model.encode(vocab_arr.tolist(), show_progress_bar=True),
+            dtype=torch.float,
+        )
+        data["doc", "contains", "word"].edge_index   = torch.empty((2, 0), dtype=torch.long)
+        data["word", "rev_contains", "doc"].edge_index = torch.empty((2, 0), dtype=torch.long)
+        data["word", "relates", "word"].edge_index   = torch.empty((2, 0), dtype=torch.long)
+        # Cache vocab/bow so future runs skip spaCy lemmatisation
+        if edge_cache_path is not None and not _cache_was_used:
+            _save_parse_cache(
+                edge_cache_path, vocab_arr, bow_sparse,
+                [], [], [], [], len(documents),
+            )
+        return data, vocab_arr.tolist(), bow_sparse, 0, 0
+
+    # ---- Active dependency types ----
+    if graph_mode == "filtered":
+        active_deps = INFORMATIVE_DEP_TYPES
+    elif graph_mode == "full_dep":
+        active_deps = ALL_CONTENT_DEP_TYPES
+    else:  # no_syntax
+        active_deps = frozenset()
+
+    if not _cache_was_used:
+        # ---- 3. Syntactic parsing ----
+        print("3/5  Syntactic parsing...")
+        doc_word_src, doc_word_dst = [], []
+        word_word_src, word_word_dst = [], []
+        dep_counts = defaultdict(int)
+
+        for d_idx, text in enumerate(tqdm(documents, desc="Dependency parsing")):
+            doc = nlp_model(text)
+            for token in doc:
+                if token.is_stop or not token.is_alpha or len(token.lemma_) <= 2:
+                    continue
+                lemma = token.lemma_.lower()
+                if lemma not in vocab:
+                    continue
+                w_idx = vocab[lemma]
+                doc_word_src.append(d_idx)
+                doc_word_dst.append(w_idx)
+                if active_deps:
+                    head_lemma = token.head.lemma_.lower()
+                    if (
+                        token.dep_ in active_deps
+                        and not token.head.is_stop
+                        and token.head.is_alpha
+                        and head_lemma != lemma
+                        and head_lemma in vocab
+                    ):
+                        word_word_src.append(w_idx)
+                        word_word_dst.append(vocab[head_lemma])
+                        dep_counts[token.dep_] += 1
+
+        if dep_counts:
+            print("  Syntactic edge distribution:")
+            for dep, cnt in sorted(dep_counts.items(), key=lambda x: -x[1]):
+                print(f"    {dep:12s}: {cnt:6d}")
+
+        # Save cache for future runs
+        if edge_cache_path is not None:
+            _save_parse_cache(
+                edge_cache_path, vocab_arr, bow_sparse,
+                doc_word_src, doc_word_dst,
+                word_word_src, word_word_dst,
+                len(documents),
+            )
+    else:
+        print("3/5  Syntactic parsing skipped (cache hit).")
+
+    # ---- 4. Word embeddings (static) ----
+    print("4/5  Encoding vocabulary (SBERT static)...")
+    word_embs_static = sbert_model.encode(vocab_arr.tolist(), show_progress_bar=True)
+    data["word"].x = torch.tensor(word_embs_static, dtype=torch.float)
+
+    # ---- 5. Build edge tensors ----
+    print("5/5  Building edge tensors...")
+    dw_idx = torch.tensor([doc_word_src, doc_word_dst], dtype=torch.long)
+    data["doc", "contains", "word"].edge_index     = dw_idx
+    data["word", "rev_contains", "doc"].edge_index = dw_idx[[1, 0]]   # mirrored
+
+    if word_word_src and graph_mode != "no_syntax":
+        data["word", "relates", "word"].edge_index = torch.tensor(
+            [word_word_src, word_word_dst], dtype=torch.long
+        )
+    else:
+        data["word", "relates", "word"].edge_index = torch.empty((2, 0), dtype=torch.long)
+        if graph_mode == "no_syntax":
+            print("  MODE 'no_syntax': word-word edges omitted.")
+
+    n_dw = len(doc_word_src)
+    n_ww = len(word_word_src)
+    print(f"  Doc-word edges : {n_dw:,}")
+    print(f"  Word-word edges: {n_ww:,}")
+    return data, vocab_arr.tolist(), bow_sparse, n_dw, n_ww
