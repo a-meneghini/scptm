@@ -234,12 +234,15 @@ class VariationalGraphTopicModel(nn.Module):
         -------
         recon : torch.Tensor, shape (B, V)
         """
-        D = self.topic_embeddings.shape[-1]
         topic_norm = F.normalize(self.topic_embeddings, p=2, dim=-1)  # (K, D)
         word_norm  = F.normalize(word_embs,             p=2, dim=-1)  # (V, D)
-        # Scaled dot-product: temperature = sqrt(D) stabilises softmax gradients
+        # Raw cosine similarity in [-1, 1] — NO temperature divisor.
+        # The attention-style / sqrt(D) scaling is correct for raw dot products
+        # of unnormalised vectors, but it collapses to near-zero values (~±0.05)
+        # when applied to already-normalised cosine similarities, making the
+        # softmax nearly uniform over the full vocabulary and killing gradients.
         beta_live = F.softmax(
-            torch.matmul(topic_norm, word_norm.T) / (D ** 0.5),
+            torch.matmul(topic_norm, word_norm.T),
             dim=-1,
         )                                                              # (K, V)
         return torch.matmul(theta_d, beta_live)                       # (B, V)
