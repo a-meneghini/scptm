@@ -118,11 +118,13 @@ class VariationalGraphTopicModel(nn.Module):
         num_topics: int,
         vocab_size: int,
         graph_mode: str = "filtered",
+        beta_temperature: float = 0.1,
     ):
         super().__init__()
-        self.num_topics  = num_topics
-        self.vocab_size  = vocab_size
-        self.graph_mode  = graph_mode
+        self.num_topics       = num_topics
+        self.vocab_size       = vocab_size
+        self.graph_mode       = graph_mode
+        self.beta_temperature = beta_temperature
 
         self.encoder = VariationalGraphEncoder(
             in_channels, hidden_channels, num_topics, graph_mode
@@ -194,7 +196,7 @@ class VariationalGraphTopicModel(nn.Module):
                     sims = F.cosine_similarity(topic_embs, repr_kw, dim=-1)
                 beta_matrix[:, w_idx] = sims
 
-        self._cached_beta = F.softmax(beta_matrix, dim=-1)
+        self._cached_beta = F.softmax(beta_matrix / self.beta_temperature, dim=-1)
         self._beta_dirty = False
         return self._cached_beta
 
@@ -236,13 +238,13 @@ class VariationalGraphTopicModel(nn.Module):
         """
         topic_norm = F.normalize(self.topic_embeddings, p=2, dim=-1)  # (K, D)
         word_norm  = F.normalize(word_embs,             p=2, dim=-1)  # (V, D)
-        # Raw cosine similarity in [-1, 1] — NO temperature divisor.
-        # The attention-style / sqrt(D) scaling is correct for raw dot products
-        # of unnormalised vectors, but it collapses to near-zero values (~±0.05)
-        # when applied to already-normalised cosine similarities, making the
-        # softmax nearly uniform over the full vocabulary and killing gradients.
+        # Scale cosine similarities by 1/T before softmax.
+        # In D=384 space random unit vectors have cosine std ≈ 1/√384 ≈ 0.051;
+        # without scaling, softmax over V≈4000 words is nearly uniform and
+        # carries no gradient signal.  T=0.1 maps the range to ≈ [-10, +10],
+        # which produces a peaked, discriminative distribution.
         beta_live = F.softmax(
-            torch.matmul(topic_norm, word_norm.T),
+            torch.matmul(topic_norm, word_norm.T) / self.beta_temperature,
             dim=-1,
         )                                                              # (K, V)
         return torch.matmul(theta_d, beta_live)                       # (B, V)

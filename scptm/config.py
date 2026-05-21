@@ -124,6 +124,12 @@ class SCPTMConfig:
     max_ctx_occurrences: int = 50
     beta_refresh_epochs: int = 5
 
+    # ---- Beta temperature ----
+    # Scales cosine similarities before softmax.  cos-sim in D=384 space
+    # concentrates near 0 (std ≈ 1/√D ≈ 0.051); dividing by T=0.1 maps the
+    # range to ≈ [-10, +10] which produces a discriminative softmax.
+    beta_temperature: float = 0.1
+
     # ---- Regularisation ----
     topic_diversity_weight: float = 0.1   # FIX: repulsion between topic embeddings
 

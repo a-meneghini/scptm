@@ -189,6 +189,72 @@ def _save_parse_cache(
     print(f"  [EdgeCache] Saved to '{path}'")
 
 
+def load_ctx_embs_from_cache(
+    path: Union[str, Path],
+    vocab_size: int,
+) -> Optional[list]:
+    """
+    Try to load a previously saved ``ctx_embs_list`` from the parse cache.
+
+    Returns the list (one entry per vocabulary word) if the cache file exists
+    **and** was built with the same vocabulary size, otherwise returns ``None``
+    (triggering a fresh ``collect_contextual_embeddings`` call).
+
+    Parameters
+    ----------
+    path : str | Path
+        Same file used for the parse cache (ctx embeddings are piggy-backed
+        onto the same pickle).
+    vocab_size : int
+        Expected number of entries in the list.
+    """
+    if not os.path.exists(path):
+        return None
+    with open(path, "rb") as f:
+        cache = pickle.load(f)
+    ctx = cache.get("ctx_embs_list")
+    if ctx is None:
+        return None
+    if cache.get("_ctx_vocab_size") != vocab_size:
+        warnings.warn(
+            f"[CtxCache] Vocabulary size changed ({cache.get('_ctx_vocab_size')} "
+            f"→ {vocab_size}).  Ignoring cached contextual embeddings."
+        )
+        return None
+    print(f"  [CtxCache] Loaded from '{path}' — skipping contextual embedding pass.")
+    return ctx
+
+
+def save_ctx_embs_to_cache(
+    path: Union[str, Path],
+    ctx_embs_list: list,
+) -> None:
+    """
+    Persist ``ctx_embs_list`` into the existing parse cache file.
+
+    The function loads the current cache, injects the new keys, and writes
+    it back atomically.  If the cache file does not exist yet (e.g. mode
+    'none' without a prior full parse), a minimal new file is created.
+
+    Parameters
+    ----------
+    path : str | Path
+        Same file used for the parse cache.
+    ctx_embs_list : list
+        One entry per vocabulary word — ``torch.Tensor | None``.
+    """
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            cache = pickle.load(f)
+    else:
+        cache = {}
+    cache["ctx_embs_list"]    = ctx_embs_list
+    cache["_ctx_vocab_size"]  = len(ctx_embs_list)
+    with open(path, "wb") as f:
+        pickle.dump(cache, f)
+    print(f"  [CtxCache] Saved to '{path}'")
+
+
 def _load_parse_cache(path: Union[str, Path], n_docs: int):
     """
     Load a previously saved parse cache.

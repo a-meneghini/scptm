@@ -26,7 +26,9 @@ from .graph import (
     build_hetero_graph,
     collect_contextual_embeddings,
     estimate_graph_memory,
+    load_ctx_embs_from_cache,
     prepare_corpus,
+    save_ctx_embs_to_cache,
 )
 from .keywords import extract_separated_topics, extract_top_words
 from .nlp import setup_nlp_pipeline
@@ -149,21 +151,54 @@ class SCPTM:
         self._graph_data = self._graph_data.to(self._device)
         self._static_word_embs = self._graph_data["word"].x.clone().to(self._device)
 
-        # ---- 5. Contextual embeddings ----
-        _ctx_dict = collect_contextual_embeddings(
-            self._corpus, self._nlp, self._sbert, self._vocab_idx,
-            cfg.max_ctx_occurrences,
-        )
-        self._ctx_embs_list = [
-            _ctx_dict[w].to("cpu") if w in _ctx_dict else None
-            for w in self._vocab
-        ]
+        # ---- 5. Contextual embeddings (with cache support) ----
+        self._ctx_embs_list = None
+        if edge_cache_path is not None:
+            self._ctx_embs_list = load_ctx_embs_from_cache(
+                edge_cache_path, len(self._vocab)
+            )
+        if self._ctx_embs_list is None:
+            _ctx_dict = collect_contextual_embeddings(
+                self._corpus, self._nlp, self._sbert, self._vocab_idx,
+                cfg.max_ctx_occurrences,
+            )
+            self._ctx_embs_list = [
+                _ctx_dict[w].to("cpu") if w in _ctx_dict else None
+                for w in self._vocab
+            ]
+            if edge_cache_path is not None:
+                save_ctx_embs_to_cache(edge_cache_path, self._ctx_embs_list)
 
         # ---- 6. Model ----
         self._nn = VariationalGraphTopicModel(
             emb_dim, cfg.hidden_channels, cfg.num_topics,
             len(self._vocab), graph_mode=cfg.graph_mode,
+            beta_temperature=cfg.beta_temperature,
         ).to(self._device)
+
+        # ---- 6b. K-means initialisation of topic embeddings ----
+        # Starting from k-means centroids of the document embedding space
+        # breaks random symmetry and gives each topic a meaningful initial
+        # direction, dramatically reducing the chance of mode collapse.
+        try:
+            from sklearn.cluster import MiniBatchKMeans
+
+            doc_embs_np = self._graph_data["doc"].x.cpu().numpy()
+            kmeans = MiniBatchKMeans(
+                n_clusters=cfg.num_topics,
+                random_state=cfg.random_state,
+                n_init=3,
+                max_iter=300,
+            ).fit(doc_embs_np)
+            centers = torch.tensor(
+                kmeans.cluster_centers_, dtype=torch.float32
+            )
+            centers = F.normalize(centers, p=2, dim=-1).to(self._device)
+            with torch.no_grad():
+                self._nn.topic_embeddings.data.copy_(centers)
+            print(f"  Topic embeddings initialised from k-means centroids.")
+        except Exception as e:  # pragma: no cover
+            print(f"  [WARN] K-means init failed ({e}); using random init.")
 
         # ---- 7. Training (+ optional iterative refinement) ----
         if iterative_refinement and n_refinement_steps > 0:
@@ -548,6 +583,7 @@ class SCPTM:
             state["config"].num_topics,
             len(state["vocab"]),
             graph_mode=state["config"].graph_mode,
+            beta_temperature=getattr(state["config"], "beta_temperature", 0.1),
         ).to(model._device)
         model._nn.load_state_dict(state["nn_state_dict"])
         model._nn._cached_beta = (
