@@ -18,11 +18,14 @@ GRAPH_MODES = {
 }
 
 # Dependency relation sets used in 'filtered' and 'full_dep' modes.
+# "obj" is the Universal Dependencies v2 label used by Italian (and newer
+# English) spaCy models; "dobj" is the legacy English label — both included
+# for cross-lingual compatibility.
 INFORMATIVE_DEP_TYPES: frozenset = frozenset({
-    "nsubj", "dobj", "amod", "nmod", "compound", "conj", "xcomp",
+    "nsubj", "obj", "dobj", "amod", "nmod", "compound", "conj", "xcomp",
 })
 ALL_CONTENT_DEP_TYPES: frozenset = frozenset({
-    "nsubj", "nsubjpass", "dobj", "iobj", "amod", "nmod", "compound",
+    "nsubj", "nsubjpass", "obj", "dobj", "iobj", "amod", "nmod", "compound",
     "conj", "xcomp", "ccomp", "advcl", "relcl", "appos", "attr",
     "pobj", "advmod", "npadvmod",
 })
@@ -111,7 +114,7 @@ class SCPTMConfig:
     kl_max: float = 1.0
     kl_warmup_epochs: int = 20
     kl_strategy: Literal["linear", "cyclical", "constant"] = "linear"
-    free_bits: float = 0.0
+    free_bits: float = 0.5          # FIX: floor on KL prevents trivial collapse
     n_mc_samples: int = 1
 
     # ---- Graph ----

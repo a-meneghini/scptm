@@ -210,19 +210,52 @@ class VariationalGraphTopicModel(nn.Module):
         """Encode documents to (mu, logvar)."""
         return self.encoder(x_dict, edge_index_dict)
 
-    def decode(self, theta_d: torch.Tensor) -> torch.Tensor:
+    def decode_train(
+        self,
+        theta_d: torch.Tensor,
+        word_embs: torch.Tensor,
+    ) -> torch.Tensor:
         """
-        Reconstruct BoW distribution from topic mixture theta_d.
+        Differentiable decode used **during training**.
+
+        Computes beta on-the-fly via scaled cosine similarity between
+        topic_embeddings and static word embeddings.  Because no `no_grad`
+        barrier exists here, the reconstruction loss can propagate gradients
+        all the way back to topic_embeddings, preventing posterior collapse
+        and topic degeneration.
 
         Parameters
         ----------
         theta_d : torch.Tensor, shape (B, K)
-            Topic mixture (simplex).
+        word_embs : torch.Tensor, shape (V, D)
+            Static SBERT word embeddings (already on the correct device).
 
         Returns
         -------
         recon : torch.Tensor, shape (B, V)
-            Reconstructed word probability distribution.
+        """
+        D = self.topic_embeddings.shape[-1]
+        topic_norm = F.normalize(self.topic_embeddings, p=2, dim=-1)  # (K, D)
+        word_norm  = F.normalize(word_embs,             p=2, dim=-1)  # (V, D)
+        # Scaled dot-product: temperature = sqrt(D) stabilises softmax gradients
+        beta_live = F.softmax(
+            torch.matmul(topic_norm, word_norm.T) / (D ** 0.5),
+            dim=-1,
+        )                                                              # (K, V)
+        return torch.matmul(theta_d, beta_live)                       # (B, V)
+
+    def decode(self, theta_d: torch.Tensor) -> torch.Tensor:
+        """
+        Decode using the cached contextual beta — used at **evaluation time**
+        (keyword extraction, get_topic_info).  Does NOT carry gradients.
+
+        Parameters
+        ----------
+        theta_d : torch.Tensor, shape (B, K)
+
+        Returns
+        -------
+        recon : torch.Tensor, shape (B, V)
         """
         if self._cached_beta is None:
             raise RuntimeError(

@@ -6,6 +6,8 @@ Training loop for SCPTM with all fixes applied:
   [FIX-2] beta invalidated after every optimizer step, recomputed lazily
            (full recompute every beta_refresh_epochs — expensive but correct)
   [FIX-3] topic_diversity_weight applied to repulsion loss
+  [FIX-4] decode_train() used in loss: differentiable beta lets recon_loss
+           propagate gradients to topic_embeddings, preventing collapse
 """
 
 import math
@@ -85,21 +87,25 @@ def _compute_loss(
     bow_sparse,
     cfg: SCPTMConfig,
     device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    static_word_embs: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Compute total ELBO loss for a mini-batch.
+    Compute ELBO loss for a mini-batch.
+
+    Uses decode_train() so that the reconstruction loss propagates gradients
+    to topic_embeddings via the differentiable beta.  [FIX-4]
 
     Returns
     -------
-    loss, recon_loss, kl_loss : all scalar tensors
+    recon_loss, kl_loss : scalar tensors
     """
     B = len(batch_indices)
     idx_np = batch_indices.cpu().numpy()
 
-    # ---- Reparameterise & decode ----
+    # ---- Reparameterise & decode (differentiable path) ----
     z = model.reparameterize(mu, logvar)
     theta_d = F.softmax(z, dim=-1)
-    recon_probs = model.decode(theta_d)                             # (B, V)
+    recon_probs = model.decode_train(theta_d, static_word_embs)     # (B, V)
 
     # ---- BoW target  [FIX-1] ----
     bow_raw = torch.tensor(
@@ -209,7 +215,8 @@ def train(
                     mu, logvar = model.encode(batch.x_dict, batch.edge_index_dict)
                     doc_indices = batch["doc"].n_id
                     recon_loss, kl_loss = _compute_loss(
-                        model, mu, logvar, doc_indices, bow_csr, cfg, device
+                        model, mu, logvar, doc_indices, bow_csr, cfg, device,
+                        static_word_embs,
                     )
                     div_loss = model.topic_diversity_loss()
                     loss = (
@@ -246,7 +253,8 @@ def train(
                     mu_b     = mu[batch_indices]
                     logvar_b = logvar[batch_indices]
                     recon_loss, kl_loss = _compute_loss(
-                        model, mu_b, logvar_b, batch_indices, bow_csr, cfg, device
+                        model, mu_b, logvar_b, batch_indices, bow_csr, cfg, device,
+                        static_word_embs,
                     )
                     div_loss = model.topic_diversity_loss()
                     loss = (

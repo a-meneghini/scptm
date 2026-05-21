@@ -308,8 +308,12 @@ def build_hetero_graph(
             ]
             lemma_docs.append(" ".join(lemmas))
 
+        # stop_words=None: spaCy already filtered stop words during lemmatisation
+        # (t.is_stop guard above). Passing the raw spaCy list to CountVectorizer
+        # triggers sklearn warnings for Italian because lemmatised stop-word forms
+        # ("gl", "nient") don't match the original list entries.
         vectorizer = CountVectorizer(
-            stop_words=stop_words,
+            stop_words=None,
             min_df=cfg.min_df,
             max_features=cfg.max_features,
             token_pattern=r"(?u)\b[a-zA-Z][a-zA-Z]+\b",
