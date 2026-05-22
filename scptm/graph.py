@@ -19,8 +19,8 @@ build_hetero_graph(documents, sbert_model, nlp_model, stop_words, cfg,
       ("word", "relates",      "word")  — syntactic dependency edges
 
     When edge_cache_path is provided:
-      * First run  — parses corpus, writes results to the cache file.
-      * Later runs — loads from cache, skips spaCy entirely.
+      * First run  — parses corpus, encodes SBERT embeddings, writes all to cache.
+      * Later runs — loads from cache, skips spaCy AND SBERT encode entirely.
 
 collect_contextual_embeddings(documents, nlp_model, sbert_model, vocab,
                                max_occurrences_per_word) → dict
@@ -206,8 +206,14 @@ def _save_parse_cache(
     word_word_src: list,
     word_word_dst: list,
     n_docs: int,
+    doc_embs: Optional[np.ndarray] = None,
+    word_embs_static: Optional[np.ndarray] = None,
 ) -> None:
-    """Persist the NLP-heavy outputs so they can be reused across runs."""
+    """Persist the NLP-heavy outputs so they can be reused across runs.
+
+    doc_embs and word_embs_static are optional; when provided they are stored
+    so that subsequent calls to build_hetero_graph can skip SBERT entirely.
+    """
     cache = {
         "_n_docs":       n_docs,
         "vocab_arr":     vocab_arr,
@@ -217,6 +223,10 @@ def _save_parse_cache(
         "word_word_src": word_word_src,
         "word_word_dst": word_word_dst,
     }
+    if doc_embs is not None:
+        cache["doc_embs"] = doc_embs
+    if word_embs_static is not None:
+        cache["word_embs_static"] = word_embs_static
     with open(path, "wb") as f:
         pickle.dump(cache, f)
     print(f"  [EdgeCache] Saved to '{path}'")
@@ -424,27 +434,41 @@ def build_hetero_graph(
         _cache_was_used = False
 
     # ---- 2. Document embeddings ----
-    print("2/5  Encoding documents (SBERT)...")
-    doc_embs = sbert_model.encode(documents, show_progress_bar=True)
+    if _cache is not None and _cache.get("doc_embs") is not None:
+        print("2/5  Document embeddings loaded from cache.")
+        doc_embs = _cache["doc_embs"]
+    else:
+        print("2/5  Encoding documents (SBERT)...")
+        doc_embs = sbert_model.encode(documents, show_progress_bar=True)
     data = HeteroData()
     data["doc"].x = torch.tensor(doc_embs, dtype=torch.float)
 
     # ---- None mode: no edges ----
     if graph_mode == "none":
         print("  MODE 'none': no edges generated (CTM-like baseline).")
-        data["word"].x = torch.tensor(
-            sbert_model.encode(vocab_arr.tolist(), show_progress_bar=True),
-            dtype=torch.float,
-        )
-        data["doc", "contains", "word"].edge_index   = torch.empty((2, 0), dtype=torch.long)
+        if _cache is not None and _cache.get("word_embs_static") is not None:
+            print("  Word embeddings loaded from cache.")
+            word_embs_none = _cache["word_embs_static"]
+        else:
+            word_embs_none = sbert_model.encode(vocab_arr.tolist(), show_progress_bar=True)
+        data["word"].x = torch.tensor(word_embs_none, dtype=torch.float)
+        data["doc", "contains", "word"].edge_index     = torch.empty((2, 0), dtype=torch.long)
         data["word", "rev_contains", "doc"].edge_index = torch.empty((2, 0), dtype=torch.long)
-        data["word", "relates", "word"].edge_index   = torch.empty((2, 0), dtype=torch.long)
-        # Cache vocab/bow so future runs skip spaCy lemmatisation
-        if edge_cache_path is not None and not _cache_was_used:
-            _save_parse_cache(
-                edge_cache_path, vocab_arr, bow_sparse,
-                [], [], [], [], len(documents),
+        data["word", "relates", "word"].edge_index     = torch.empty((2, 0), dtype=torch.long)
+        # Cache vocab/bow/embeddings so future runs skip spaCy + SBERT entirely
+        if edge_cache_path is not None:
+            _needs_save = (
+                not _cache_was_used
+                or _cache.get("doc_embs") is None
+                or _cache.get("word_embs_static") is None
             )
+            if _needs_save:
+                _save_parse_cache(
+                    edge_cache_path, vocab_arr, bow_sparse,
+                    [], [], [], [], len(documents),
+                    doc_embs=doc_embs,
+                    word_embs_static=word_embs_none,
+                )
         return data, vocab_arr.tolist(), bow_sparse, 0, 0
 
     # ---- Active dependency types ----
@@ -491,21 +515,34 @@ def build_hetero_graph(
             for dep, cnt in sorted(dep_counts.items(), key=lambda x: -x[1]):
                 print(f"    {dep:12s}: {cnt:6d}")
 
-        # Save cache for future runs
-        if edge_cache_path is not None:
+    else:
+        print("3/5  Syntactic parsing skipped (cache hit).")
+
+    # ---- 4. Word embeddings (static) ----
+    if _cache is not None and _cache.get("word_embs_static") is not None:
+        print("4/5  Word embeddings loaded from cache.")
+        word_embs_static = _cache["word_embs_static"]
+    else:
+        print("4/5  Encoding vocabulary (SBERT static)...")
+        word_embs_static = sbert_model.encode(vocab_arr.tolist(), show_progress_bar=True)
+    data["word"].x = torch.tensor(word_embs_static, dtype=torch.float)
+
+    # ---- Save / update cache with edge lists + embeddings ----
+    if edge_cache_path is not None:
+        _needs_save = (
+            not _cache_was_used
+            or _cache.get("doc_embs") is None
+            or _cache.get("word_embs_static") is None
+        )
+        if _needs_save:
             _save_parse_cache(
                 edge_cache_path, vocab_arr, bow_sparse,
                 doc_word_src, doc_word_dst,
                 word_word_src, word_word_dst,
                 len(documents),
+                doc_embs=doc_embs,
+                word_embs_static=word_embs_static,
             )
-    else:
-        print("3/5  Syntactic parsing skipped (cache hit).")
-
-    # ---- 4. Word embeddings (static) ----
-    print("4/5  Encoding vocabulary (SBERT static)...")
-    word_embs_static = sbert_model.encode(vocab_arr.tolist(), show_progress_bar=True)
-    data["word"].x = torch.tensor(word_embs_static, dtype=torch.float)
 
     # ---- 5. Build edge tensors ----
     print("5/5  Building edge tensors...")
