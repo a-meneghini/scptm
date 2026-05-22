@@ -114,7 +114,9 @@ class SCPTMConfig:
     kl_max: float = 1.0
     kl_warmup_epochs: int = 20
     kl_strategy: Literal["linear", "cyclical", "constant"] = "linear"
-    free_bits: float = 0.5          # FIX: floor on KL prevents trivial collapse
+    free_bits: float = 0.1          # floor on KL per dim (0.5 was too high: with
+                                    # K=10 the floor=5.0 pinned KL and zeroed
+                                    # encoder gradients from the KL term)
     n_mc_samples: int = 1
 
     # ---- Graph ----
