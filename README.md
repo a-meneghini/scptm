@@ -184,7 +184,7 @@ model.get_topics_dict(top_k=5)          # returns single words + bigrams/trigram
 
 ---
 
-## Iterative refinement (TriTopic-inspired)
+## Iterative refinement
 
 Alternates between standard training and blending document embeddings toward their
 dominant topic centroid. Useful when the initial embedding space lacks clear cluster structure.
