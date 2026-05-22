@@ -177,26 +177,39 @@ class SCPTM:
         ).to(self._device)
 
         # ---- 6b. K-means initialisation of topic embeddings ----
-        # Starting from k-means centroids of the document embedding space
-        # breaks random symmetry and gives each topic a meaningful initial
-        # direction, dramatically reducing the chance of mode collapse.
+        # Topic embeddings live in the SAME space as word embeddings (SBERT
+        # single-word encodings).  Clustering WORD embeddings (not document
+        # embeddings) guarantees high cosine similarity between each topic
+        # centroid and its cluster members, so beta is discriminative from
+        # epoch 1 and the reconstruction gradient flows properly.
+        #
+        # Document-centroid init looks intuitive but fails: a centroid of
+        # ~900 sentence embeddings has cosine sim only ~0.15 with individual
+        # word embeddings → logit ≈ 1.5 at T=0.1 → beta still near-uniform.
         try:
             from sklearn.cluster import MiniBatchKMeans
 
-            doc_embs_np = self._graph_data["doc"].x.cpu().numpy()
+            word_embs_np = self._static_word_embs.cpu().numpy()  # (V, D)
             kmeans = MiniBatchKMeans(
                 n_clusters=cfg.num_topics,
                 random_state=cfg.random_state,
-                n_init=3,
+                n_init=5,
                 max_iter=300,
-            ).fit(doc_embs_np)
-            centers = torch.tensor(
-                kmeans.cluster_centers_, dtype=torch.float32
-            )
-            centers = F.normalize(centers, p=2, dim=-1).to(self._device)
+            ).fit(word_embs_np)
+            centers = F.normalize(
+                torch.tensor(kmeans.cluster_centers_, dtype=torch.float32),
+                p=2, dim=-1,
+            ).to(self._device)
             with torch.no_grad():
                 self._nn.topic_embeddings.data.copy_(centers)
-            print(f"  Topic embeddings initialised from k-means centroids.")
+
+            # Quick quality check: mean cosine sim of each centroid vs its cluster
+            sims = torch.matmul(centers, F.normalize(self._static_word_embs, p=2, dim=-1).T)
+            mean_sim = sims.max(dim=0).values.mean().item()
+            print(
+                f"  Topic embeddings initialised from word-embedding k-means "
+                f"(mean top-sim per word: {mean_sim:.3f})"
+            )
         except Exception as e:  # pragma: no cover
             print(f"  [WARN] K-means init failed ({e}); using random init.")
 
@@ -210,6 +223,7 @@ class SCPTM:
                 self._graph_data, self._bow_sparse, self._nn,
                 self._ctx_embs_list, self._static_word_embs,
                 cfg, self._device,
+                vocab=self._vocab,
             )
 
         # ---- 8. Final inference ----
@@ -313,6 +327,7 @@ class SCPTM:
                 self._graph_data, self._bow_sparse, self._nn,
                 self._ctx_embs_list, self._static_word_embs,
                 cfg, self._device,
+                vocab=self._vocab,
             )
             # Merge history
             for k in ["loss", "recon", "kl", "kl_weight"]:

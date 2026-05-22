@@ -137,6 +137,7 @@ def train(
     static_word_embs: torch.Tensor,
     cfg: SCPTMConfig,
     device: torch.device,
+    vocab: Optional[List[str]] = None,
 ) -> dict:
     """
     Train SCPTM and return a history dict with per-epoch metrics.
@@ -155,6 +156,10 @@ def train(
         Static SBERT word embeddings on `device`.
     cfg : SCPTMConfig
     device : torch.device
+    vocab : list[str] | None
+        Vocabulary for NPMI coherence logging.  When None the metric is
+        skipped (avoids the index-vs-string mismatch that previously always
+        returned 0.0).
 
     Returns
     -------
@@ -283,9 +288,14 @@ def train(
             model.eval()
             # Recompute beta after the epoch's invalidations
             model.compute_contextual_beta(ctx_embs_list, static_word_embs)
-            top_words = extract_top_words(model, None, top_k=10)
-            npmi = compute_npmi_coherence(top_words, bow_csr, list(range(len(top_words[0]))))
-            div  = compute_topic_diversity(top_words)
+            top_words = extract_top_words(model, vocab, top_k=10)
+            # compute_npmi_coherence needs word strings; skip when vocab absent
+            if vocab is not None and top_words and top_words[0] and isinstance(top_words[0][0], str):
+                npmi = compute_npmi_coherence(top_words, bow_csr, vocab)
+            else:
+                npmi = float("nan")
+            div = compute_topic_diversity(top_words if vocab is not None else
+                                          [[str(i) for i in row] for row in top_words])
             history["coherence_npmi"].append(npmi)
             history["topic_diversity"].append(div)
             history["metric_epochs"].append(epoch)
