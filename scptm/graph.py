@@ -394,14 +394,23 @@ def build_hetero_graph(
         _cache = _load_parse_cache(edge_cache_path, len(documents))
 
     if _cache is not None:
-        # Cache hit: restore vocabulary and edge lists without re-parsing
+        # Cache hit: restore vocabulary and (conditionally) edge lists
         vocab_arr  = _cache["vocab_arr"]
         bow_sparse = _cache["bow_sparse"]
         vocab      = {word: idx for idx, word in enumerate(vocab_arr)}
-        doc_word_src  = _cache["doc_word_src"]
-        doc_word_dst  = _cache["doc_word_dst"]
-        word_word_src = _cache["word_word_src"]
-        word_word_dst = _cache["word_word_dst"]
+        # Edge lists are valid only when the cache was built by a non-"none" run
+        # (doc_word_src non-empty) OR when the current mode is "none" (edges unused).
+        # If a "none"-mode run created the cache first, the edge lists are [] and
+        # must be rebuilt for any mode that needs them.
+        _cache_edges_valid = (
+            graph_mode == "none"
+            or len(_cache.get("doc_word_src", [])) > 0
+        )
+        if _cache_edges_valid:
+            doc_word_src  = _cache["doc_word_src"]
+            doc_word_dst  = _cache["doc_word_dst"]
+            word_word_src = _cache["word_word_src"]
+            word_word_dst = _cache["word_word_dst"]
         print(f"  Vocabulary: {len(vocab)} unique lemmas (from cache).")
         _cache_was_used = True
     else:
@@ -432,6 +441,7 @@ def build_hetero_graph(
         vocab      = {word: idx for idx, word in enumerate(vocab_arr)}
         print(f"  Vocabulary: {len(vocab)} unique lemmas.")
         _cache_was_used = False
+        _cache_edges_valid = False
 
     # ---- 2. Document embeddings ----
     if _cache is not None and _cache.get("doc_embs") is not None:
@@ -455,17 +465,23 @@ def build_hetero_graph(
         data["doc", "contains", "word"].edge_index     = torch.empty((2, 0), dtype=torch.long)
         data["word", "rev_contains", "doc"].edge_index = torch.empty((2, 0), dtype=torch.long)
         data["word", "relates", "word"].edge_index     = torch.empty((2, 0), dtype=torch.long)
-        # Cache vocab/bow/embeddings so future runs skip spaCy + SBERT entirely
+        # Cache vocab/bow/embeddings so future runs skip spaCy + SBERT entirely.
+        # IMPORTANT: preserve any existing edge lists in the cache — a "none"-mode
+        # run must not overwrite real edges built by a prior "filtered"/"full_dep" run.
         if edge_cache_path is not None:
             _needs_save = (
-                not _cache_was_used
+                _cache is None
                 or _cache.get("doc_embs") is None
                 or _cache.get("word_embs_static") is None
             )
             if _needs_save:
+                _dw_src = _cache.get("doc_word_src", []) if _cache else []
+                _dw_dst = _cache.get("doc_word_dst", []) if _cache else []
+                _ww_src = _cache.get("word_word_src", []) if _cache else []
+                _ww_dst = _cache.get("word_word_dst", []) if _cache else []
                 _save_parse_cache(
                     edge_cache_path, vocab_arr, bow_sparse,
-                    [], [], [], [], len(documents),
+                    _dw_src, _dw_dst, _ww_src, _ww_dst, len(documents),
                     doc_embs=doc_embs,
                     word_embs_static=word_embs_none,
                 )
@@ -479,8 +495,10 @@ def build_hetero_graph(
     else:  # no_syntax
         active_deps = frozenset()
 
-    if not _cache_was_used:
+    if not _cache_was_used or not _cache_edges_valid:
         # ---- 3. Syntactic parsing ----
+        # Runs when: (a) no cache at all, or (b) cache exists but was built with
+        # graph_mode="none" (empty edge lists) and current mode needs real edges.
         print("3/5  Syntactic parsing...")
         doc_word_src, doc_word_dst = [], []
         word_word_src, word_word_dst = [], []
@@ -530,7 +548,8 @@ def build_hetero_graph(
     # ---- Save / update cache with edge lists + embeddings ----
     if edge_cache_path is not None:
         _needs_save = (
-            not _cache_was_used
+            not _cache_was_used        # no cache at all → save everything
+            or not _cache_edges_valid  # cache had empty edges (from a prior "none" run)
             or _cache.get("doc_embs") is None
             or _cache.get("word_embs_static") is None
         )
