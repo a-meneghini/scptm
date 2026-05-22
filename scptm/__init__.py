@@ -7,7 +7,7 @@ A variational graph-based topic model that integrates:
   - VAE framework with KL annealing, free bits, and MC uncertainty
   - Scikit-learn compatible API (fit / transform / fit_transform)
 
-Author: (your name)
+Author: (Alessandro Meneghini)
 License: MIT
 """
 
