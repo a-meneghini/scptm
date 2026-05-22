@@ -1,13 +1,39 @@
 """
 scptm/training.py
 -----------------
-Training loop for SCPTM with all fixes applied:
-  [FIX-1] BoW normalisation before reconstruction loss
-  [FIX-2] beta invalidated after every optimizer step, recomputed lazily
-           (full recompute every beta_refresh_epochs — expensive but correct)
-  [FIX-3] topic_diversity_weight applied to repulsion loss
-  [FIX-4] decode_train() used in loss: differentiable beta lets recon_loss
-           propagate gradients to topic_embeddings, preventing collapse
+Training loop for SCPTM.
+
+Public API
+----------
+train(graph_data, bow_sparse, model, ctx_embs_list, static_word_embs,
+      cfg, device, vocab=None) → history dict
+
+    Trains the model and returns per-epoch metrics:
+    loss, recon, kl, kl_weight, coherence_npmi, topic_diversity,
+    metric_epochs.
+
+    vocab : list[str] | None
+        Pass the full vocabulary list to get correct NPMI coherence in the
+        training log.  If None, NPMI is reported as nan.
+
+compute_kl_weight(epoch, kl_warmup_epochs, kl_max, strategy) → float
+normalise_bow(bow, strategy) → Tensor
+
+Design notes
+------------
+* decode_train() is used in the loss (not the cached beta) so the
+  reconstruction gradient flows back to topic_embeddings via the
+  differentiable cosine-similarity beta.
+
+* beta is invalidated (model.invalidate_beta()) after every optimizer step
+  and fully recomputed every cfg.beta_refresh_epochs epochs.
+
+* BoW target is normalised (TF / log1p / none) before cross-entropy so that
+  the loss is not dominated by document length.
+
+* Gradient clipping at max_norm=5.0 to prevent exploding gradients in the GNN.
+
+* AMP (mixed precision) is enabled on CUDA when cfg.use_mixed_precision=True.
 """
 
 import math

@@ -3,6 +3,26 @@ scptm/config.py
 ---------------
 Central configuration dataclass for SCPTM.
 All hyper-parameters in one place — no scattered magic numbers.
+
+Quick reference
+---------------
+SCPTMConfig is a frozen-style dataclass; all fields have sensible defaults.
+Pass it to SCPTM(config=cfg) or use keyword shortcuts SCPTM(num_topics=15).
+
+Most important parameters for tuning results:
+
+  num_topics          — try 5–20; more topics → finer granularity but
+                        requires larger corpus for statistical support
+  graph_mode          — "filtered" (default) uses informative syntactic
+                        dependencies; "none" is a fast CTM-like baseline
+  beta_temperature    — lower T → sharper topic-word distributions;
+                        reduce to 0.05 for very large vocabularies
+  epochs              — 50 is usually enough; increase if Recon still
+                        declining at final epoch
+  free_bits           — per-dimension KL floor; 0.1 works well for K≤20
+  topic_diversity_weight — increase to 0.2+ if topics collapse
+  lang                — "eng" (all-MiniLM-L6-v2) or "ita"
+                        (paraphrase-multilingual-MiniLM-L12-v2)
 """
 
 from dataclasses import dataclass, field

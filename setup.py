@@ -15,17 +15,17 @@ with open("README.md", encoding="utf-8") as f:
 
 setup(
     name="scptm",
-    version="0.1.0",
-    author="Your Name",
-    author_email="your@email.com",
+    version="0.2.0",
+    author="Alessandro Meneghini",
+    author_email="",
     description=(
         "SCPTM: Structural Contextual Probabilistic Topic Model — "
-        "a VAE-GNN topic model with syntactic dependency graphs and "
-        "contextual word embeddings."
+        "a VAE-GNN topic model with syntactic dependency graphs, "
+        "contextual word embeddings, and beta temperature scaling."
     ),
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/your-username/scptm",
+    url="https://github.com/alemeneghini/scptm",
     packages=find_packages(),
     python_requires=">=3.9",
     install_requires=[

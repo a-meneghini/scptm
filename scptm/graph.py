@@ -2,6 +2,39 @@
 scptm/graph.py
 --------------
 Corpus preprocessing, vocabulary building, and heterogeneous graph construction.
+
+Public functions
+----------------
+prepare_corpus(source, source_type, ...) → List[str]
+    Load and optionally chunk a text corpus from a folder, DataFrame, or list.
+
+build_hetero_graph(documents, sbert_model, nlp_model, stop_words, cfg,
+                   edge_cache_path=None)
+    → (HeteroData, vocab_list, bow_sparse, n_dw, n_ww)
+
+    Builds a heterogeneous PyG graph with node types "doc" and "word" and
+    edge types:
+      ("doc",  "contains",     "word")  — doc-word co-occurrence
+      ("word", "rev_contains", "doc")   — mirrored
+      ("word", "relates",      "word")  — syntactic dependency edges
+
+    When edge_cache_path is provided:
+      * First run  — parses corpus, writes results to the cache file.
+      * Later runs — loads from cache, skips spaCy entirely.
+
+collect_contextual_embeddings(documents, nlp_model, sbert_model, vocab,
+                               max_occurrences_per_word) → dict
+    Returns word → Tensor(N, D) of SBERT document embeddings for contexts
+    in which each vocabulary word appears.
+
+load_ctx_embs_from_cache(path, vocab_size) → list | None
+save_ctx_embs_to_cache(path, ctx_embs_list)
+    Piggy-back the contextual embeddings onto the parse cache pickle,
+    so the expensive SBERT contextual pass is also skipped on reload.
+
+estimate_graph_memory(n_docs, vocab_size, n_edges_dw, n_edges_ww, ...) → dict
+    Estimate GPU memory for the heterogeneous graph (prints a warning if
+    the estimate exceeds 8 GB).
 """
 
 import os

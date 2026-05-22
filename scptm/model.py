@@ -1,14 +1,50 @@
 """
 scptm/model.py
 --------------
-Main SCPTM class with scikit-learn compatible API.
+Main SCPTM class — scikit-learn compatible API.
 
-Key additions vs original script:
-  - fit() / transform() / fit_transform() interface
-  - save() / load() with full state persistence
-  - transform() for out-of-sample documents
-  - Iterative refinement (optional) — pulls doc embeddings toward topic centroids
-  - run_ablation_study() class method
+Public interface
+----------------
+fit(source, source_type, ..., edge_cache_path=None) → self
+    Full training pipeline:
+      1. NLP pipeline (SBERT + spaCy)
+      2. Corpus loading and optional chunking
+      3. Heterogeneous graph construction (or cache load)
+      4. Contextual embedding collection (or cache load)
+      5. Model creation with word k-means topic initialisation
+      6. VAE-GNN training
+      7. Final inference (theta + optional MC uncertainty)
+
+transform(documents) → Tensor(n, K)
+    Out-of-sample inference for new documents.
+
+fit_transform(source, ...) → Tensor(n, K)
+    Convenience: fit then return theta.
+
+get_topic_info(top_k, method) → DataFrame
+    Top words per topic + dominant document count.
+
+get_topics_dict(top_k, method) → dict
+    Separated single-word and multi-word-expression keywords per topic.
+
+get_document_topics() → DataFrame
+    Per-document dominant topic and probability.
+
+get_uncertainty_report() → DataFrame
+    MC uncertainty classification (requires n_mc_samples > 1).
+
+evaluate(true_labels, theta_runs) → dict
+    NPMI coherence, topic diversity, NMI, downstream F1, stability ARI.
+
+plot_training() / visualize_3d() / visualize_2d()
+    Training curves and semantic space visualisations.
+
+save(path) / load(path)
+    Full state persistence including edge indices, contextual embeddings,
+    and cached beta — loaded models perform full GNN inference in transform().
+
+run_ablation_study(documents, epochs, **kwargs) → DataFrame
+    Train one SCPTM per graph_mode and compare metrics side by side.
 """
 
 import pickle

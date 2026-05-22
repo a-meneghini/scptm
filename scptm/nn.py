@@ -3,12 +3,45 @@ scptm/nn.py
 -----------
 Neural network components for SCPTM.
 
-Key fixes vs original:
-  [FIX-1] mode 'none' uses forward_encoder consistently (no stale cat workaround)
-  [FIX-2] contextual beta is now invalidated after every optimizer step and
-          lazily recomputed before decode — ensures encoder/decoder alignment
-  [FIX-3] topic_diversity_loss: cosine repulsion between topic embeddings
-           to prevent topic collapse
+Classes
+-------
+VariationalGraphEncoder
+    Encodes document embeddings to (μ, logσ²) in topic space.
+    Graph modes use a 1-layer HeteroConv/GAT (2 heads).
+    Mode 'none' uses a 2-layer MLP over document features only.
+
+VariationalGraphTopicModel
+    Full VAE-GNN topic model.  Key methods:
+
+    encode(x_dict, edge_index_dict) → (μ, logσ²)
+    reparameterize(μ, logσ²) → z
+    decode_train(θ, word_embs) → recon_probs
+        Differentiable path used during training.  Beta is computed
+        on-the-fly as softmax(topic_norm @ word_norm.T / T) so gradients
+        flow all the way back to topic_embeddings.
+    decode(θ) → recon_probs
+        Cached contextual beta path used at evaluation time.
+    compute_contextual_beta(ctx_embs_list, static_word_embs) → beta
+        Attention-pooled contextual embeddings → (K, V) beta matrix.
+    topic_diversity_loss() → scalar
+        Mean pairwise cosine similarity between topic embeddings
+        (minimise to push topics apart).
+
+Design notes
+------------
+* Beta temperature (default T=0.1): cosine similarities in R^384 concentrate
+  near 0 (std ≈ 1/√384 ≈ 0.051).  Dividing by T maps the range to ≈[−10,+10]
+  which produces a peaked, discriminative softmax and non-zero gradients.
+  Without this, reconstruction loss is stuck at log(V) forever.
+
+* Topic embedding init: topic_embeddings are initialised from k-means
+  centroids of the *word* embedding space in model.fit() (not document
+  embeddings).  This guarantees high cosine similarity between each topic
+  and its vocabulary cluster from epoch 1.
+
+* invalidate_beta() / _beta_dirty flag: beta is marked stale after every
+  optimizer step and lazily recomputed before evaluation, ensuring
+  encoder and decoder are always in sync.
 """
 
 import torch
