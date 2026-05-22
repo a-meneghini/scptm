@@ -2,7 +2,7 @@
 scptm/config.py
 ---------------
 Central configuration dataclass for SCPTM.
-All hyper-parameters in one place — no scattered magic numbers.
+All hyper-parameters in one place.
 
 Quick reference
 ---------------
