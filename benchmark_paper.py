@@ -179,13 +179,57 @@ def evaluate_all(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_20newsgroups():
-    """Load 20 Newsgroups. Returns (docs, labels, label_names)."""
+    """Load 20 Newsgroups. Returns (docs, labels, label_names).
+
+    Tries sklearn's built-in downloader first (with a socket-level timeout
+    override to avoid indefinite hanging).  If that fails with a network error
+    (common on Colab / restricted environments) it falls back to the HuggingFace
+    Hub mirror via the ``datasets`` library.
+    """
     print("\n[Corpus] Loading 20 Newsgroups …")
-    data   = fetch_20newsgroups(subset="all", remove=("headers", "footers", "quotes"))
-    docs   = data.data
-    labels = data.target
-    print(f"  {len(docs):,} documents, {len(data.target_names)} categories")
-    return docs, labels, data.target_names
+
+    # ── Attempt 1: sklearn fetch (raises on 504 / network errors) ─────────────
+    try:
+        import socket
+        _orig_timeout = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(60)          # 60-second cap per connection
+        try:
+            data = fetch_20newsgroups(
+                subset="all", remove=("headers", "footers", "quotes")
+            )
+        finally:
+            socket.setdefaulttimeout(_orig_timeout)
+
+        docs   = data.data
+        labels = data.target
+        print(f"  {len(docs):,} documents, {len(data.target_names)} categories")
+        return docs, labels, data.target_names
+
+    except Exception as e:
+        print(f"  sklearn download failed ({type(e).__name__}: {e})")
+        print("  Falling back to HuggingFace datasets mirror …")
+
+    # ── Attempt 2: HuggingFace mirror ─────────────────────────────────────────
+    try:
+        from datasets import load_dataset
+        ds = load_dataset("SetFit/20_newsgroups", split="train+test")
+        label_names = ds.features["label"].names
+        docs   = [r["text"]  for r in ds]
+        labels = [r["label"] for r in ds]
+        import numpy as np
+        labels = np.array(labels)
+        print(f"  {len(docs):,} documents, {len(label_names)} categories (HF mirror)")
+        return docs, labels, label_names
+    except Exception as e2:
+        raise RuntimeError(
+            "Could not load 20 Newsgroups via sklearn or HuggingFace.\n"
+            f"  sklearn error  : {e}\n"
+            f"  HF error       : {e2}\n\n"
+            "On Colab you can pre-download it manually:\n"
+            "  from sklearn.datasets import fetch_20newsgroups\n"
+            "  fetch_20newsgroups(subset='all', remove=('headers','footers','quotes'))\n"
+            "then re-run the benchmark."
+        ) from e2
 
 
 def load_ungdc(max_docs: int = None):
@@ -211,7 +255,7 @@ def load_reddit_politics(csv_path: str):
             "and set REDDIT_CSV in CONFIG."
         )
     df   = pd.read_csv(csv_path)
-    text_col = next(c for c in df.columns if "text" in c.lower() or "body" in c.lower())
+    text_col = next(c for c in df.columns if "Title" in c.lower() or "Text" in c.lower())
     docs = df[text_col].dropna().astype(str).tolist()
     docs = [d for d in docs if len(d.split()) >= 10]   # drop very short posts
     print(f"  {len(docs):,} posts (≥10 words)")
@@ -244,28 +288,39 @@ def build_reference_bow(docs: list, min_df: int = 5, max_features: int = 20_000)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_lda(docs: list, K: int, seed: int, min_df: int = 5):
-    """Train gensim LDA. Returns (topic_words, theta)."""
+    """Train gensim LDA. Returns (topic_words, theta).
+
+    Speed notes:
+    - passes=5 is enough for benchmarking (was 10).
+    - chunksize=4000 reduces overhead on large corpora.
+    - Theta is extracted via lda.inference() (one vectorised C call)
+      instead of a Python loop over every document.
+    """
+    import os as _os
+    n_workers = max(1, min(4, (_os.cpu_count() or 2) - 1))
+
     # Tokenise with the same stop-word filter as the reference BoW
     vec   = CountVectorizer(stop_words="english", min_df=min_df,
                             token_pattern=r"(?u)\b[a-zA-Z][a-zA-Z]+\b")
     vec.fit(docs)
-    vocab_list = vec.get_feature_names_out().tolist()
+    vocab_set  = set(vec.get_feature_names_out().tolist())
 
     tokenised = [
-        [t for t in doc.lower().split() if t in set(vocab_list)]
+        [t for t in doc.lower().split() if t in vocab_set]
         for doc in docs
     ]
     tokenised = [t for t in tokenised if t]   # drop empty docs
 
-    dct     = corpora.Dictionary(tokenised)
-    corpus  = [dct.doc2bow(tok) for tok in tokenised]
+    dct    = corpora.Dictionary(tokenised)
+    corpus = [dct.doc2bow(tok) for tok in tokenised]
 
     lda = LdaMulticore(
         corpus,
         num_topics   = K,
         id2word      = dct,
-        passes       = 10,
-        workers      = 2,
+        passes       = 5,           # was 10 — 5 is sufficient for benchmarking
+        chunksize    = 4000,        # larger chunks → fewer inter-worker syncs
+        workers      = n_workers,
         random_state = seed,
     )
 
@@ -275,15 +330,10 @@ def run_lda(docs: list, K: int, seed: int, min_df: int = 5):
         for k in range(K)
     ]
 
-    # Document-topic distributions (n_docs × K)
-    theta_rows = []
-    for bow_doc in corpus:
-        dist   = lda.get_document_topics(bow_doc, minimum_probability=0.0)
-        row    = np.zeros(K)
-        for tid, prob in dist:
-            row[tid] = prob
-        theta_rows.append(row)
-    theta = np.vstack(theta_rows) if theta_rows else np.zeros((len(docs), K))
+    # Document-topic distributions (n_docs × K) — vectorised, no Python loop
+    # lda.inference() returns (gamma, sstats); gamma shape = (n_docs, K)
+    gamma, _ = lda.inference(corpus)
+    theta = (gamma / gamma.sum(axis=1, keepdims=True)).astype(np.float32)
 
     return topic_words, theta
 
