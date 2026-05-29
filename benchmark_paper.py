@@ -305,11 +305,13 @@ def run_lda(docs: list, K: int, seed: int, min_df: int = 5):
     vec.fit(docs)
     vocab_set  = set(vec.get_feature_names_out().tolist())
 
-    tokenised = [
+    tokenised_raw = [
         [t for t in doc.lower().split() if t in vocab_set]
         for doc in docs
     ]
-    tokenised = [t for t in tokenised if t]   # drop empty docs
+    # Track which original docs survive the empty-doc filter (needed for NMI)
+    doc_mask  = np.array([bool(t) for t in tokenised_raw])
+    tokenised = [t for t in tokenised_raw if t]
 
     dct    = corpora.Dictionary(tokenised)
     corpus = [dct.doc2bow(tok) for tok in tokenised]
@@ -335,7 +337,7 @@ def run_lda(docs: list, K: int, seed: int, min_df: int = 5):
     gamma, _ = lda.inference(corpus)
     theta = (gamma / gamma.sum(axis=1, keepdims=True)).astype(np.float32)
 
-    return topic_words, theta
+    return topic_words, theta, doc_mask
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -356,6 +358,11 @@ def run_scptm_variant(
     Returns (topic_words, theta).
     Cache is shared across K/seed — SBERT and spaCy run only once.
     """
+    # Mirror the prepare_corpus filter (graph.py line 120) to build doc_mask.
+    # SCPTM silently drops docs with ≤10 chars before training; we track which
+    # original docs survive so callers can align true_labels for NMI.
+    doc_mask = np.array([len(str(d).strip()) > 10 for d in docs])
+
     model = SCPTM(
         num_topics   = K,
         graph_mode   = graph_mode,
@@ -374,8 +381,8 @@ def run_scptm_variant(
         [w.strip() for w in row["keywords"].split(",")]
         for _, row in info.sort_values("topic_id").iterrows()
     ]
-    theta = model._theta.numpy()   # (n_docs, K)
-    return topic_words, theta
+    theta = model._theta.numpy()   # (n_valid_docs, K)
+    return topic_words, theta, doc_mask
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -422,7 +429,9 @@ def run_bertopic(
     else:
         theta = None
 
-    return topic_words, theta
+    # BERTopic processes every document (no filtering), so all labels are valid
+    doc_mask = np.ones(len(docs), dtype=bool)
+    return topic_words, theta, doc_mask
 
 
 def _make_umap(seed):
@@ -498,32 +507,46 @@ def run_corpus_sweep(
                     continue
 
                 print(f"\n  ── {model_name}  K={K}  seed={seed} ──")
-                theta = None
+                theta    = None
+                doc_mask = None
                 try:
                     if model_name == "LDA":
-                        topic_words, theta = run_lda(docs, K, seed, min_df)
+                        topic_words, theta, doc_mask = run_lda(docs, K, seed, min_df)
 
                     elif model_name == "CTM":
-                        topic_words, theta = run_scptm_variant(
+                        topic_words, theta, doc_mask = run_scptm_variant(
                             docs, K, seed, "none", cache_path, min_df)
 
                     elif model_name == "SCPTM":
-                        topic_words, theta = run_scptm_variant(
+                        topic_words, theta, doc_mask = run_scptm_variant(
                             docs, K, seed, "filtered", cache_path, min_df)
 
                     elif model_name == "BERTopic":
-                        topic_words, theta = run_bertopic(
+                        topic_words, theta, doc_mask = run_bertopic(
                             docs, K, seed, sbert_embs, min_df)
+
+                    # Subset true_labels to only the docs the model actually saw,
+                    # avoiding "inconsistent number of samples" NMI errors.
+                    aligned_labels = None
+                    if true_labels is not None and doc_mask is not None:
+                        aligned_labels = np.array(true_labels)[doc_mask]
+                    elif true_labels is not None:
+                        aligned_labels = true_labels
 
                     metrics = evaluate_all(
                         topic_words, bow_ref, vocab_ref, sbert,
-                        theta=theta, true_labels=true_labels,
+                        theta=theta, true_labels=aligned_labels,
                     )
 
                 except Exception as exc:
                     print(f"  [ERROR] {model_name} K={K} seed={seed}: {exc}")
                     metrics = dict(npmi=np.nan, we_coherence=np.nan,
                                    diversity=np.nan, quality=np.nan)
+
+                # Always include nmi so every CSV row has the same columns.
+                # Rows where NMI wasn't computed get NaN rather than a missing field,
+                # which prevents pandas from misreading the CSV on the next restart.
+                metrics.setdefault("nmi", np.nan)
 
                 row = dict(corpus=corpus_name, model=model_name, K=K, seed=seed,
                            **metrics)
