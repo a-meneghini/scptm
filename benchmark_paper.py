@@ -88,10 +88,11 @@ warnings.filterwarnings("ignore")
 # Locally : str(Path(__file__).parent / "benchmark_cache")
 DRIVE_ROOT = str(Path(__file__).parent / "benchmark_cache")
 
-# Path to the Reddit Lib/Con CSV from Kaggle.
-# Download from: https://www.kaggle.com/datasets/neelgajare/liberals-vs-conservatives-on-reddit-13000-posts
-# On Colab: "/content/drive/MyDrive/reddit_pol.csv"
-REDDIT_CSV = str(Path(__file__).parent / "reddit_pol.csv")
+# Path to the Reddit Lib/Con CSV.
+# On Colab: upload reddit_pol.csv to the S-CPTM folder on Drive and set
+#   DRIVE_ROOT = "/content/drive/MyDrive/S-CPTM"  (see above).
+# The file is then auto-found at DRIVE_ROOT/reddit_pol.csv.
+REDDIT_CSV = str(Path(DRIVE_ROOT) / "reddit_pol.csv")
 
 # Shared SBERT model
 SBERT_MODEL = "all-MiniLM-L6-v2"
@@ -245,21 +246,48 @@ def load_ungdc(max_docs: int = None):
 
 
 def load_reddit_politics(csv_path: str):
-    """Load Reddit liberals-vs-conservatives CSV (Kaggle)."""
+    """Load Reddit liberals-vs-conservatives CSV.
+
+    Combines the Title and Text fields (Text is NaN for ~81 % of posts which
+    are link submissions; Title alone averages only 12.6 words).  The merged
+    document is richer and more stable for topic modelling.
+
+    Returns (docs, labels) where labels is a 0/1 array
+    (0 = Conservative, 1 = Liberal) aligned with docs.
+    """
     print("\n[Corpus] Loading Reddit politics …")
     if not os.path.exists(csv_path):
         raise FileNotFoundError(
             f"Reddit CSV not found at '{csv_path}'.\n"
-            "Download from https://www.kaggle.com/datasets/neelgajare/"
-            "liberals-vs-conservatives-on-reddit-13000-posts\n"
-            "and set REDDIT_CSV in CONFIG."
+            "Upload reddit_pol.csv to your DRIVE_ROOT folder on Google Drive\n"
+            "and make sure DRIVE_ROOT points to that folder."
         )
-    df   = pd.read_csv(csv_path)
-    text_col = next(c for c in df.columns if "Title" in c.lower() or "Text" in c.lower())
-    docs = df[text_col].dropna().astype(str).tolist()
-    docs = [d for d in docs if len(d.split()) >= 10]   # drop very short posts
-    print(f"  {len(docs):,} posts (≥10 words)")
-    return docs
+    df = pd.read_csv(csv_path)
+
+    # Build document = Title + body text (where available)
+    def _merge(row):
+        title = str(row.get("Title", "")).strip()
+        body  = str(row.get("Text",  "")).strip()
+        if body and body.lower() != "nan":
+            return f"{title} {body}".strip()
+        return title
+
+    raw_docs   = df.apply(_merge, axis=1).tolist()
+    raw_labels = df.get("Political Lean", pd.Series(dtype=str)).fillna("").tolist()
+
+    # Map labels to int (Conservative=0, Liberal=1); unknown → -1
+    label_map = {"Conservative": 0, "Liberal": 1}
+    docs, labels = [], []
+    for doc, lbl in zip(raw_docs, raw_labels):
+        if len(doc.split()) >= 5:          # was 10 — relaxed because titles are short
+            docs.append(doc)
+            labels.append(label_map.get(lbl, -1))
+
+    labels = np.array(labels)
+    n_lib  = int((labels == 1).sum())
+    n_con  = int((labels == 0).sum())
+    print(f"  {len(docs):,} posts (≥5 words) — Liberal: {n_lib:,}  Conservative: {n_con:,}")
+    return docs, labels
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -756,17 +784,17 @@ def main():
     print("CORPUS 3/3 — Reddit Liberals vs Conservatives  (K-sweep)")
     print("=" * 65)
 
-    rd_docs  = load_reddit_politics(REDDIT_CSV)
-    rd_bow, rd_vocab = build_reference_bow(rd_docs, min_df=5)
-    rd_cache         = str(Path(DRIVE_ROOT) / "reddit_cache.pkl")
-    rd_embs          = precompute_sbert_embeddings(
-                          rd_docs, str(Path(DRIVE_ROOT) / "reddit"))
+    rd_docs, rd_labels = load_reddit_politics(REDDIT_CSV)
+    rd_bow, rd_vocab   = build_reference_bow(rd_docs, min_df=5)
+    rd_cache           = str(Path(DRIVE_ROOT) / "reddit_cache.pkl")
+    rd_embs            = precompute_sbert_embeddings(
+                            rd_docs, str(Path(DRIVE_ROOT) / "reddit"))
 
     raw_rd = run_corpus_sweep(
         "Reddit_Pol", rd_docs, K_RANGE,
         rd_bow, rd_vocab, sbert,
         rd_cache, rd_embs,
-        min_df=5,
+        true_labels=rd_labels, min_df=5,
     )
     all_raw.append(raw_rd)
 
