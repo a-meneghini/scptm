@@ -94,6 +94,12 @@ DRIVE_ROOT = str(Path(__file__).parent / "benchmark_cache")
 # The file is then auto-found at DRIVE_ROOT/reddit_pol.csv.
 REDDIT_CSV = str(Path(DRIVE_ROOT) / "reddit_pol.csv")
 
+# Optional local CSV fallback for UN General Debates.
+# If the HuggingFace mirror is unavailable, download the CSV from Kaggle:
+#   https://www.kaggle.com/datasets/unitednations/un-general-debates
+# and upload it to DRIVE_ROOT.  Leave as None to rely on HuggingFace.
+UNGDC_CSV = str(Path(DRIVE_ROOT) / "un-general-debates.csv")
+
 # Shared SBERT model
 SBERT_MODEL = "all-MiniLM-L6-v2"
 
@@ -234,15 +240,60 @@ def load_20newsgroups():
 
 
 def load_ungdc(max_docs: int = None):
-    """Load UN General Debate Corpus from HuggingFace."""
+    """Load UN General Debate Corpus.
+
+    Resolution order:
+    1. Local CSV at UNGDC_CSV (upload from Kaggle to DRIVE_ROOT — fastest).
+    2. HuggingFace mirror "Eugleo/un-general-debates".
+    3. HuggingFace mirror "joelniklaus/un-general-debates".
+
+    The Kaggle CSV has columns: session, year, country, text.
+    Download from: https://www.kaggle.com/datasets/unitednations/un-general-debates
+    """
     print("\n[Corpus] Loading UN General Debates …")
+
+    # ── 1. Local CSV (preferred on Colab — no network dependency) ────────────
+    if os.path.exists(UNGDC_CSV):
+        print(f"  Loading from local CSV: {UNGDC_CSV}")
+        df   = pd.read_csv(UNGDC_CSV)
+        text_col = next(
+            (c for c in df.columns if c.lower() in ("text", "speech", "statement")),
+            df.columns[-1],
+        )
+        docs = df[text_col].dropna().astype(str).tolist()
+        docs = [d for d in docs if len(d.split()) >= 20]
+        if max_docs:
+            docs = docs[:max_docs]
+        print(f"  {len(docs):,} speeches (local CSV)")
+        return docs
+
+    # ── 2–3. HuggingFace mirrors ──────────────────────────────────────────────
     from datasets import load_dataset
-    ds   = load_dataset("Eugleo/un-general-debates", split="train")
-    docs = [r["text"] for r in ds]
-    if max_docs:
-        docs = docs[:max_docs]
-    print(f"  {len(docs):,} speeches")
-    return docs
+    hf_paths = [
+        ("Eugleo/un-general-debates",     "train", "text"),
+        ("joelniklaus/un-general-debates", "train", "text"),
+    ]
+    last_err = None
+    for hf_path, split, text_field in hf_paths:
+        try:
+            print(f"  Trying HuggingFace: {hf_path} …")
+            ds   = load_dataset(hf_path, split=split)
+            docs = [r[text_field] for r in ds]
+            if max_docs:
+                docs = docs[:max_docs]
+            print(f"  {len(docs):,} speeches ({hf_path})")
+            return docs
+        except Exception as e:
+            print(f"  ✗ {hf_path}: {e}")
+            last_err = e
+
+    raise RuntimeError(
+        "Could not load UN General Debates from any source.\n\n"
+        "Download the CSV from Kaggle and upload it to your DRIVE_ROOT folder:\n"
+        "  https://www.kaggle.com/datasets/unitednations/un-general-debates\n"
+        f"Expected path: {UNGDC_CSV}\n"
+        f"Last error: {last_err}"
+    )
 
 
 def load_reddit_politics(csv_path: str):
