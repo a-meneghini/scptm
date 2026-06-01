@@ -113,6 +113,15 @@ SEEDS = [42, 123, 2024]
 # Training epochs for CTM / SCPTM
 EPOCHS = 50
 
+# Top-k words saved per topic — identical for every model
+TOP_K_WORDS = 10
+
+# sklearn English stop words used as a final safety filter on all top-word lists.
+# Each runner already filters internally (CountVectorizer or spaCy), but the
+# filter sets differ slightly; this shared post-processing guarantees consistency.
+from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS as _SKL_STOPS
+_STOP_SET = set(_SKL_STOPS) | {"said", "says", "also", "would", "could", "may"}
+
 # Output directory
 OUT_DIR = Path(DRIVE_ROOT) / "results"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -363,10 +372,34 @@ def build_reference_bow(docs: list, min_df: int = 5, max_features: int = 20_000)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Shared top-word post-processing
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _clean_topic_words(topic_words: list, top_k: int = TOP_K_WORDS) -> list:
+    """
+    Uniform post-processing applied to every model's top-word lists:
+      - strip whitespace
+      - drop empty strings and single-character tokens
+      - remove stop words that slipped through model-internal filters
+        (spaCy list ≠ sklearn list; both are applied here)
+      - truncate / pad to exactly `top_k` entries so all models are comparable
+    """
+    cleaned = []
+    for words in topic_words:
+        kept = [
+            w.strip() for w in words
+            if w.strip() and len(w.strip()) > 1 and w.strip().lower() not in _STOP_SET
+        ]
+        cleaned.append(kept[:top_k])
+    return cleaned
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # LDA runner
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_lda(docs: list, K: int, seed: int, min_df: int = 5):
+def run_lda(docs: list, K: int, seed: int, min_df: int = 5,
+            top_k: int = TOP_K_WORDS):
     """Train gensim LDA. Returns (topic_words, theta).
 
     Speed notes:
@@ -406,10 +439,10 @@ def run_lda(docs: list, K: int, seed: int, min_df: int = 5):
     )
 
     # Top words per topic
-    topic_words = [
-        [w for w, _ in lda.show_topic(k, topn=10)]
+    topic_words = _clean_topic_words([
+        [w for w, _ in lda.show_topic(k, topn=top_k + 5)]   # fetch a few extra, clean, then trim
         for k in range(K)
-    ]
+    ], top_k=top_k)
 
     # Document-topic distributions (n_docs × K) — vectorised, no Python loop
     # lda.inference() returns (gamma, sstats); gamma shape = (n_docs, K)
@@ -431,6 +464,7 @@ def run_scptm_variant(
     cache_path: str,
     min_df: int = 5,
     max_features: int = 20_000,
+    top_k: int = TOP_K_WORDS,
 ):
     """
     Train CTM (graph_mode='none') or SCPTM (graph_mode='filtered').
@@ -455,11 +489,11 @@ def run_scptm_variant(
     )
     model.fit_transform(docs, edge_cache_path=cache_path)
 
-    info        = model.get_topic_info(top_k=10)
-    topic_words = [
+    info        = model.get_topic_info(top_k=top_k + 5)   # fetch extra, clean, trim
+    topic_words = _clean_topic_words([
         [w.strip() for w in row["keywords"].split(",")]
         for _, row in info.sort_values("topic_id").iterrows()
-    ]
+    ], top_k=top_k)
     theta = model._theta.numpy()   # (n_valid_docs, K)
     return topic_words, theta, doc_mask
 
@@ -474,6 +508,7 @@ def run_bertopic(
     seed: int,
     precomputed_embs: np.ndarray,
     min_df: int = 5,
+    top_k: int = TOP_K_WORDS,
 ):
     """Train BERTopic. Reuses pre-computed embeddings to avoid double SBERT."""
     sbert = SentenceTransformer(SBERT_MODEL)
@@ -493,11 +528,12 @@ def run_bertopic(
     )
     _, probs = bt.fit_transform(docs, embeddings=precomputed_embs)
 
-    topic_words = []
+    raw_words = []
     for tid in sorted(bt.get_topics()):
         if tid == -1:
             continue
-        topic_words.append([w for w, _ in bt.get_topic(tid)[:10]])
+        raw_words.append([w for w, _ in bt.get_topic(tid)[:top_k + 5]])
+    topic_words = _clean_topic_words(raw_words, top_k=top_k)
 
     # probs shape: (n_docs, n_topics)  or None
     if probs is not None:
@@ -558,8 +594,9 @@ def run_corpus_sweep(
     Returns a DataFrame with one row per (model, K, seed).
     Results are appended to a CSV after each row for crash recovery.
     """
-    out_csv = OUT_DIR / f"raw_{corpus_name}.csv"
-    rows    = []
+    out_csv   = OUT_DIR / f"raw_{corpus_name}.csv"
+    words_csv = OUT_DIR / f"words_{corpus_name}.csv"
+    rows      = []
 
     # Load existing results if resuming
     if out_csv.exists():
@@ -619,24 +656,46 @@ def run_corpus_sweep(
 
                 except Exception as exc:
                     print(f"  [ERROR] {model_name} K={K} seed={seed}: {exc}")
-                    metrics = dict(npmi=np.nan, we_coherence=np.nan,
-                                   diversity=np.nan, quality=np.nan)
+                    import traceback; traceback.print_exc()
+                    metrics     = dict(npmi=np.nan, we_coherence=np.nan,
+                                       diversity=np.nan, quality=np.nan)
+                    topic_words = []   # nothing to save for words CSV
 
                 # Always include nmi so every CSV row has the same columns.
-                # Rows where NMI wasn't computed get NaN rather than a missing field,
-                # which prevents pandas from misreading the CSV on the next restart.
                 metrics.setdefault("nmi", np.nan)
 
                 row = dict(corpus=corpus_name, model=model_name, K=K, seed=seed,
                            **metrics)
                 rows.append(row)
 
-                # Append to CSV immediately (crash-safe)
+                # ── Append metrics (crash-safe) ───────────────────────────────
                 pd.DataFrame([row]).to_csv(
                     out_csv, mode="a",
                     header=not out_csv.exists() or os.stat(out_csv).st_size == 0,
                     index=False,
                 )
+
+                # ── Append top words (crash-safe) ─────────────────────────────
+                # One row per topic: corpus, model, K, seed, topic_id, keywords
+                # Keywords stored as pipe-separated string to avoid CSV quoting
+                # issues with commas inside word lists.
+                if topic_words:
+                    word_rows = [
+                        {
+                            "corpus":   corpus_name,
+                            "model":    model_name,
+                            "K":        K,
+                            "seed":     seed,
+                            "topic_id": tid + 1,
+                            "keywords": " | ".join(words),
+                        }
+                        for tid, words in enumerate(topic_words)
+                    ]
+                    pd.DataFrame(word_rows).to_csv(
+                        words_csv, mode="a",
+                        header=not words_csv.exists() or os.stat(words_csv).st_size == 0,
+                        index=False,
+                    )
                 print(f"    NPMI={metrics['npmi']:.3f}  "
                       f"WE-Coh={metrics['we_coherence']:.3f}  "
                       f"Div={metrics['diversity']:.3f}  "
