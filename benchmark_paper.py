@@ -486,6 +486,9 @@ def run_scptm_variant(
         max_features = max_features,
         random_state = seed,
         metrics_every_n_epochs = EPOCHS,   # only at final epoch → faster
+        # Neighbor sampling avoids materialising the full graph on GPU — required
+        # for large corpora (UN Debates: 10M+ edges) to stay within VRAM budget.
+        use_neighbor_sampling = (graph_mode != "none"),
     )
     model.fit_transform(docs, edge_cache_path=cache_path)
 
@@ -512,9 +515,13 @@ def run_bertopic(
 ):
     """Train BERTopic. Reuses pre-computed embeddings to avoid double SBERT."""
     sbert = SentenceTransformer(SBERT_MODEL)
+    # min_df=1 here: BERTopic re-runs this vectorizer on K pseudo-documents
+    # (one per topic) for c-TF-IDF.  If min_df > K the fit crashes with
+    # "max_df corresponds to < documents than min_df".  Vocabulary size is
+    # controlled by max_features instead.
     vec   = CountVectorizer(
         stop_words   = "english",
-        min_df       = min_df,
+        min_df       = 1,
         max_features = 20_000,
         token_pattern= r"(?u)\b[a-zA-Z][a-zA-Z]+\b",
     )
