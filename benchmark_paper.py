@@ -486,9 +486,11 @@ def run_scptm_variant(
         max_features = max_features,
         random_state = seed,
         metrics_every_n_epochs = EPOCHS,   # only at final epoch → faster
-        # Neighbor sampling avoids materialising the full graph on GPU — required
-        # for large corpora (UN Debates: 10M+ edges) to stay within VRAM budget.
-        use_neighbor_sampling = (graph_mode != "none"),
+        # DropEdge: drop 50 % of graph edges at random each epoch.
+        # Halves GNN intermediate-tensor memory — prevents CUDA OOM on large
+        # corpora (UN Debates: 14 M edges) without requiring pyg-lib/torch-sparse.
+        # On small corpora (20NG: 1.8 M edges) it acts as a regulariser.
+        edge_dropout = 0.5 if graph_mode != "none" else 0.0,
     )
     model.fit_transform(docs, edge_cache_path=cache_path)
 

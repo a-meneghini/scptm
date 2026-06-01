@@ -271,6 +271,21 @@ def train(
             n_batches = math.ceil(n_docs / cfg.batch_size)
             num_batches = n_batches
 
+            # DropEdge: sample a new edge subset once per epoch.
+            # Reduces GNN intermediate-tensor memory proportionally to dropout
+            # rate — critical for large corpora where full-graph backward OOMs.
+            if cfg.edge_dropout > 0.0 and cfg.graph_mode != "none":
+                epoch_edge_dict = {}
+                for key, eidx in graph_data.edge_index_dict.items():
+                    if eidx.size(1) > 0:
+                        keep = torch.rand(eidx.size(1), device=eidx.device) \
+                               > cfg.edge_dropout
+                        epoch_edge_dict[key] = eidx[:, keep]
+                    else:
+                        epoch_edge_dict[key] = eidx
+            else:
+                epoch_edge_dict = graph_data.edge_index_dict
+
             for b in range(n_batches):
                 start = b * cfg.batch_size
                 batch_indices = perm[start: min(start + cfg.batch_size, n_docs)]
@@ -279,7 +294,7 @@ def train(
                 with torch.amp.autocast("cuda", enabled=(scaler is not None)):
                     # [FIX-1] encoder always goes through model.encode
                     mu, logvar = model.encode(
-                        graph_data.x_dict, graph_data.edge_index_dict
+                        graph_data.x_dict, epoch_edge_dict
                     )
                     mu_b     = mu[batch_indices]
                     logvar_b = logvar[batch_indices]

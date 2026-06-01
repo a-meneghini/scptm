@@ -168,6 +168,14 @@ class SCPTMConfig:
     use_mixed_precision: bool = True
     use_neighbor_sampling: bool = False
 
+    # ---- Graph regularisation / memory management ----
+    edge_dropout: float = 0.0
+    # Fraction of graph edges dropped at random each training epoch.
+    # 0.0 = no dropout (default, full graph).
+    # 0.5 = keep 50 % of edges — halves GNN intermediate-tensor memory,
+    #        required for large corpora (e.g. UN Debates: 14 M edges).
+    # Acts as DropEdge regularisation (Rong et al. 2020) on small corpora.
+
     # ---- Reproducibility ----
     random_state: int = 42
 
