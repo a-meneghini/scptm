@@ -153,10 +153,10 @@ class SCPTMConfig:
     beta_temperature: float = 0.1
 
     # ---- Regularisation ----
-    topic_diversity_weight: float = 0.1   # FIX: repulsion between topic embeddings
+    topic_diversity_weight: float = 0.1   # cosine repulsion between topic embeddings
 
     # ---- BoW normalisation ----
-    bow_normalization: Literal["none", "tf", "log1p"] = "tf"   # FIX: bias vs doc length
+    bow_normalization: Literal["none", "tf", "log1p"] = "tf"   # normalised before reconstruction loss; corrects for document-length bias
 
     # ---- Keyword extraction ----
     keyword_method: Literal["cosine", "ctfidf"] = "cosine"
@@ -167,6 +167,42 @@ class SCPTMConfig:
     # ---- Hardware ----
     use_mixed_precision: bool = True
     use_neighbor_sampling: bool = False
+
+    # ---- Trainable word embeddings ----
+    # When True, the decoder word embeddings start from SBERT but are updated
+    # end-to-end via the reconstruction loss → β adapts to corpus co-occurrence,
+    # increasing NPMI significantly.
+    trainable_word_embeddings: bool = True
+
+    # ---- Encoder residual connection ----
+    # Add a skip connection from raw doc input to GAT output, mitigating
+    # over-smoothing and recovering NMI lost due to graph message passing.
+    encoder_residual: bool = True
+
+    # ---- PMI-based graph sparsification ----
+    # Filter word-word edges by Positive PMI (PPMI > 0) and keep at most
+    # pmi_top_k_neighbors neighbours per word node. Reduces graph density
+    # by ~70-90%, making attention selective and preventing over-smoothing.
+    pmi_sparse_graph: bool = True
+    pmi_top_k_neighbors: int = 15
+
+    # ---- Differentiable coherence losses ----
+    # npmi_coherence_weight: weight for NPMI-based coherence loss (pre-computed
+    #   co-occurrence matrix). Set > 0 to directly optimise NPMI. Start at 0.05.
+    # we_coherence_weight: weight for WE-coherence loss (cosine sim in SBERT
+    #   space). Maximises semantic compactness of topics. Start at 0.05.
+    # we_coherence_top_k: number of top words used in WE-coherence loss.
+    npmi_coherence_weight: float = 0.0
+    we_coherence_weight: float = 0.0
+    we_coherence_top_k: int = 10
+
+    # ---- Adaptive KL ----
+    # When topic entropy drops below min_topic_entropy (topics collapsing),
+    # the KL weight is temporarily boosted by adaptive_kl_boost to force
+    # the posterior back towards the prior. Helps on homogeneous corpora.
+    adaptive_kl: bool = True
+    adaptive_kl_boost: float = 0.3
+    min_topic_entropy: float = 1.0
 
     # ---- Reproducibility ----
     random_state: int = 42

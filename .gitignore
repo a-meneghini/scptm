@@ -4,6 +4,11 @@
 # Editor / Claude Code state
 .claude/
 
+# Python virtual environments
+.venv/
+venv/
+env/
+
 # Build artifacts and distributions
 *.zip
 *.egg-info/
@@ -14,15 +19,31 @@ __pycache__/
 *.pyo
 .pytest_cache/
 
-# Model checkpoints and cache files
+# Model checkpoints, parse caches, and large corpus caches
 *.pkl
 *.pt
 *.pth
 
-# Runtime outputs
+# Dataset files (large — distribute separately via Kaggle/HuggingFace links)
+*.csv
+
+# Personal / unrelated documents
+proposta_*.pdf
+
+# Node / JavaScript (not part of this project)
+node_modules/
+package.json
+package-lock.json
+
+# Runtime outputs and generated figures
 *.png
+!scptm_architecture.png
 training_history.png
 semantic_space_2d.png
 
 # Jupyter
 .ipynb_checkpoints/
+visuals.ipynb
+
+# Benchmark cache directory
+benchmark_cache/

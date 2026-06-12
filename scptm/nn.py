@@ -44,6 +44,8 @@ Design notes
   encoder and decoder are always in sync.
 """
 
+import warnings
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -75,9 +77,11 @@ class VariationalGraphEncoder(nn.Module):
         hidden_channels: int,
         num_topics: int,
         graph_mode: str = "filtered",
+        encoder_residual: bool = True,
     ):
         super().__init__()
         self.graph_mode = graph_mode
+        self.encoder_residual = encoder_residual
         gat_out = hidden_channels * 2   # 2 heads → concatenated
 
         if graph_mode == "none":
@@ -90,23 +94,33 @@ class VariationalGraphEncoder(nn.Module):
                 nn.ReLU(),
             )
         else:
-            self.conv = HeteroConv(
-                {
-                    ("doc",  "contains",    "word"): GATConv(
-                        (in_channels, in_channels), hidden_channels,
-                        heads=2, add_self_loops=False
-                    ),
-                    ("word", "relates",     "word"): GATConv(
-                        in_channels, hidden_channels,
-                        heads=2, add_self_loops=False
-                    ),
-                    ("word", "rev_contains","doc"):  GATConv(
-                        (in_channels, in_channels), hidden_channels,
-                        heads=2, add_self_loops=False
-                    ),
-                },
-                aggr="mean",
-            )
+            # NOTE: word→doc (rev_contains) removed — it propagated word
+            # representations back into doc nodes, causing over-smoothing
+            # and degrading NMI. Doc nodes are updated via the residual
+            # connection below instead.
+            # Suppress the PyG warning about doc nodes not being updated
+            # by message passing — intentional, handled by residual_proj.
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore", "There exist node types"
+                )
+                self.conv = HeteroConv(
+                    {
+                        ("doc",  "contains", "word"): GATConv(
+                            (in_channels, in_channels), hidden_channels,
+                            heads=2, add_self_loops=False
+                        ),
+                        ("word", "relates",  "word"): GATConv(
+                            in_channels, hidden_channels,
+                            heads=2, add_self_loops=False
+                        ),
+                    },
+                    aggr="mean",
+                )
+            # Residual projection: maps raw doc input to gat_out dim so it
+            # can be added to the GAT output, preserving document identity.
+            if encoder_residual:
+                self.residual_proj = nn.Linear(in_channels, gat_out, bias=False)
 
         self.mu_layer     = nn.Linear(gat_out, num_topics)
         self.logvar_layer = nn.Linear(gat_out, num_topics)
@@ -122,7 +136,19 @@ class VariationalGraphEncoder(nn.Module):
         else:
             h_dict = self.conv(x_dict, edge_index_dict)
             h_dict = {k: F.leaky_relu(v) for k, v in h_dict.items()}
-            h = h_dict["doc"]
+            # After removing rev_contains, doc nodes are no longer updated by
+            # HeteroConv. Use the residual projection of the raw doc input as
+            # the doc representation, optionally adding word-side context via
+            # any future doc-targeting relation.
+            doc_input = x_dict["doc"]
+            if self.encoder_residual:
+                h = self.residual_proj(doc_input)
+                # Add word→doc signal if present (e.g. from future relations)
+                if "doc" in h_dict:
+                    h = h + h_dict["doc"]
+            else:
+                h = h_dict.get("doc", self.residual_proj(doc_input)
+                               if hasattr(self, "residual_proj") else doc_input)
         return self.mu_layer(h), self.logvar_layer(h)
 
 
@@ -152,15 +178,19 @@ class VariationalGraphTopicModel(nn.Module):
         vocab_size: int,
         graph_mode: str = "filtered",
         beta_temperature: float = 0.1,
+        trainable_word_embeddings: bool = True,
+        encoder_residual: bool = True,
     ):
         super().__init__()
-        self.num_topics       = num_topics
-        self.vocab_size       = vocab_size
-        self.graph_mode       = graph_mode
-        self.beta_temperature = beta_temperature
+        self.num_topics                = num_topics
+        self.vocab_size                = vocab_size
+        self.graph_mode                = graph_mode
+        self.beta_temperature          = beta_temperature
+        self.trainable_word_embeddings = trainable_word_embeddings
 
         self.encoder = VariationalGraphEncoder(
-            in_channels, hidden_channels, num_topics, graph_mode
+            in_channels, hidden_channels, num_topics, graph_mode,
+            encoder_residual=encoder_residual,
         )
 
         # Learnable topic vectors in embedding space.
@@ -169,6 +199,16 @@ class VariationalGraphTopicModel(nn.Module):
         self.topic_embeddings = nn.Parameter(
             F.normalize(raw, p=2, dim=-1)
         )
+
+        # Trainable word embeddings for the decoder.
+        # When True, initialised from SBERT in model.fit() and updated
+        # end-to-end via the reconstruction loss.  This allows β to adapt
+        # to corpus co-occurrence statistics, significantly improving NPMI.
+        # When False, decode_train() receives static SBERT embeddings instead.
+        if trainable_word_embeddings:
+            self.word_embeddings = nn.Parameter(torch.zeros(vocab_size, in_channels))
+        else:
+            self.word_embeddings = None  # type: ignore[assignment]
 
         # [FIX-2] beta is always None; computed on demand before decode
         self._cached_beta: torch.Tensor | None = None
@@ -253,29 +293,25 @@ class VariationalGraphTopicModel(nn.Module):
         """
         Differentiable decode used **during training**.
 
-        Computes beta on-the-fly via scaled cosine similarity between
-        topic_embeddings and static word embeddings.  Because no `no_grad`
-        barrier exists here, the reconstruction loss can propagate gradients
-        all the way back to topic_embeddings, preventing posterior collapse
-        and topic degeneration.
+        Uses self.word_embeddings (trainable) when available, otherwise
+        falls back to the passed static SBERT word embeddings.
 
         Parameters
         ----------
         theta_d : torch.Tensor, shape (B, K)
         word_embs : torch.Tensor, shape (V, D)
-            Static SBERT word embeddings (already on the correct device).
+            Static SBERT word embeddings — used as fallback when
+            trainable_word_embeddings=False, and as initialisation source.
 
         Returns
         -------
         recon : torch.Tensor, shape (B, V)
         """
+        # Use trainable embeddings when available — they carry gradients from
+        # the reconstruction loss and adapt to corpus co-occurrence statistics.
+        embs = self.word_embeddings if self.word_embeddings is not None else word_embs
         topic_norm = F.normalize(self.topic_embeddings, p=2, dim=-1)  # (K, D)
-        word_norm  = F.normalize(word_embs,             p=2, dim=-1)  # (V, D)
-        # Scale cosine similarities by 1/T before softmax.
-        # In D=384 space random unit vectors have cosine std ≈ 1/√384 ≈ 0.051;
-        # without scaling, softmax over V≈4000 words is nearly uniform and
-        # carries no gradient signal.  T=0.1 maps the range to ≈ [-10, +10],
-        # which produces a peaked, discriminative distribution.
+        word_norm  = F.normalize(embs,                  p=2, dim=-1)  # (V, D)
         beta_live = F.softmax(
             torch.matmul(topic_norm, word_norm.T) / self.beta_temperature,
             dim=-1,
@@ -320,3 +356,68 @@ class VariationalGraphTopicModel(nn.Module):
         # Off-diagonal elements only
         mask = ~torch.eye(K, dtype=torch.bool, device=sim_matrix.device)
         return sim_matrix[mask].mean()
+
+    def we_coherence_loss(self, word_embs: torch.Tensor) -> torch.Tensor:
+        """
+        Differentiable WE-Coherence loss.
+
+        For each topic, computes a soft-weighted mean word embedding (using
+        the current β as soft attention weights) and maximises its cosine
+        similarity with the topic embedding.  This encourages the decoder to
+        select words that are semantically compact around the topic centroid.
+
+        Parameters
+        ----------
+        word_embs : torch.Tensor, shape (V, D)
+            Used as fallback when trainable word embeddings are absent.
+
+        Returns
+        -------
+        Scalar loss — negative mean WE-coherence (minimise to maximise coh.).
+        """
+        embs = self.word_embeddings if self.word_embeddings is not None else word_embs
+        topic_norm = F.normalize(self.topic_embeddings, p=2, dim=-1)  # (K, D)
+        word_norm  = F.normalize(embs, p=2, dim=-1)                   # (V, D)
+        # Soft top-k selection via the same β used in decode_train
+        beta_scores = torch.matmul(topic_norm, word_norm.T) / self.beta_temperature  # (K, V)
+        soft_w = F.softmax(beta_scores, dim=-1)                       # (K, V)
+        # Weighted mean word embedding per topic
+        mean_word = torch.matmul(soft_w, word_norm)                   # (K, D)
+        mean_word_norm = F.normalize(mean_word, p=2, dim=-1)
+        # WE-coherence: cosine similarity between topic centroid and its
+        # soft-selected word neighbourhood
+        we_coh = F.cosine_similarity(topic_norm, mean_word_norm, dim=-1)  # (K,)
+        return -we_coh.mean()  # minimise ≡ maximise WE-coherence
+
+    def npmi_coherence_loss(
+        self,
+        ppmi_tensor: torch.Tensor,
+        word_embs: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Differentiable NPMI coherence loss.
+
+        Uses a pre-computed PPMI matrix (fixed, not trained) as a reward signal:
+        the loss pushes β to concentrate probability mass on word pairs that
+        co-occur in the corpus, directly optimising NPMI.
+
+        Parameters
+        ----------
+        ppmi_tensor : torch.Tensor, shape (V, V)
+            Positive PMI matrix pre-computed from the corpus BoW.
+        word_embs : torch.Tensor, shape (V, D)
+            Fallback word embeddings when trainable_word_embeddings=False.
+
+        Returns
+        -------
+        Scalar loss — negative mean NPMI coherence (minimise to maximise).
+        """
+        embs = self.word_embeddings if self.word_embeddings is not None else word_embs
+        topic_norm = F.normalize(self.topic_embeddings, p=2, dim=-1)
+        word_norm  = F.normalize(embs, p=2, dim=-1)
+        beta_scores = torch.matmul(topic_norm, word_norm.T) / self.beta_temperature
+        soft_w = F.softmax(beta_scores, dim=-1)                       # (K, V)
+        # Coherence: for each topic k, sum_{i,j} β[k,i] * PPMI[i,j] * β[k,j]
+        # = diag(β @ PPMI @ β.T)
+        coh = torch.sum(torch.matmul(soft_w, ppmi_tensor) * soft_w, dim=-1)  # (K,)
+        return -coh.mean()  # minimise ≡ maximise NPMI coherence

@@ -37,6 +37,7 @@ estimate_graph_memory(n_docs, vocab_size, n_edges_dw, n_edges_ww, ...) → dict
     the estimate exceeds 8 GB).
 """
 
+import math
 import os
 import pickle
 import warnings
@@ -356,6 +357,96 @@ def estimate_graph_memory(
 
 
 # ---------------------------------------------------------------------------
+# PMI-based graph sparsification
+# ---------------------------------------------------------------------------
+
+def _pmi_filter_edges(
+    word_word_src: list,
+    word_word_dst: list,
+    doc_word_src: list,
+    doc_word_dst: list,
+    n_docs: int,
+    top_k: int = 15,
+) -> Tuple[list, list]:
+    """
+    Filter word-word edges by Positive PMI (PPMI > 0) and optionally
+    keep only the top-k highest-PPMI neighbours per source word.
+
+    Works on the existing syntactic edge list — does NOT recompute from
+    scratch; PPMI is estimated from the doc-word occurrence data already
+    collected during graph construction.
+
+    Parameters
+    ----------
+    word_word_src, word_word_dst : lists of word indices (syntactic edges)
+    doc_word_src, doc_word_dst   : lists for doc-word occurrence edges
+    n_docs : int                 : total number of documents
+    top_k  : int                 : max neighbours per word (0 = no limit)
+
+    Returns
+    -------
+    filtered_src, filtered_dst : filtered edge lists
+    """
+    if not word_word_src:
+        return word_word_src, word_word_dst
+
+    # Build per-word document sets (needed for PPMI estimation)
+    word_doc_sets: dict = defaultdict(set)
+    for d, w in zip(doc_word_src, doc_word_dst):
+        word_doc_sets[w].add(d)
+
+    # Compute PPMI for each unique edge pair, then filter
+    pair_ppmi: dict = {}
+    filtered_src: list = []
+    filtered_dst: list = []
+    edge_ppmi_vals: list = []
+
+    for src, dst in zip(word_word_src, word_word_dst):
+        key = (min(src, dst), max(src, dst))
+        if key not in pair_ppmi:
+            docs_s = word_doc_sets.get(src, set())
+            docs_d = word_doc_sets.get(dst, set())
+            n_s = len(docs_s)
+            n_d = len(docs_d)
+            n_co = len(docs_s & docs_d)
+            if n_co > 0 and n_s > 0 and n_d > 0:
+                pmi = math.log(
+                    (n_co / n_docs) / ((n_s / n_docs) * (n_d / n_docs))
+                )
+                pair_ppmi[key] = max(pmi, 0.0)
+            else:
+                pair_ppmi[key] = 0.0
+
+        ppmi_val = pair_ppmi[key]
+        if ppmi_val > 0.0:
+            filtered_src.append(src)
+            filtered_dst.append(dst)
+            edge_ppmi_vals.append(ppmi_val)
+
+    # Top-k neighbours per source node by PPMI score
+    if top_k > 0 and filtered_src:
+        triples = sorted(
+            zip(filtered_src, filtered_dst, edge_ppmi_vals),
+            key=lambda x: (x[0], -x[2]),
+        )
+        src_count: dict = defaultdict(int)
+        tk_src: list = []
+        tk_dst: list = []
+        for s, d, _ in triples:
+            if src_count[s] < top_k:
+                tk_src.append(s)
+                tk_dst.append(d)
+                src_count[s] += 1
+        filtered_src, filtered_dst = tk_src, tk_dst
+
+    before = len(word_word_src)
+    after  = len(filtered_src)
+    pct    = (1 - after / max(before, 1)) * 100
+    print(f"  PMI sparsification: {before:,} → {after:,} word-word edges ({pct:.0f}% reduction)")
+    return filtered_src, filtered_dst
+
+
+# ---------------------------------------------------------------------------
 # Main graph builder
 # ---------------------------------------------------------------------------
 
@@ -563,11 +654,23 @@ def build_hetero_graph(
                 word_embs_static=word_embs_static,
             )
 
+    # ---- 4b. PMI sparsification of word-word edges ----
+    # Applied AFTER cache load/save so raw edges are always cached, and
+    # the filter can be re-run with different pmi_top_k_neighbors cheaply.
+    if cfg.pmi_sparse_graph and word_word_src and graph_mode != "no_syntax":
+        word_word_src, word_word_dst = _pmi_filter_edges(
+            word_word_src, word_word_dst,
+            doc_word_src, doc_word_dst,
+            len(documents), top_k=cfg.pmi_top_k_neighbors,
+        )
+
     # ---- 5. Build edge tensors ----
     print("5/5  Building edge tensors...")
     dw_idx = torch.tensor([doc_word_src, doc_word_dst], dtype=torch.long)
-    data["doc", "contains", "word"].edge_index     = dw_idx
-    data["word", "rev_contains", "doc"].edge_index = dw_idx[[1, 0]]   # mirrored
+    data["doc", "contains", "word"].edge_index = dw_idx
+    # rev_contains removed from the encoder architecture; keep an empty tensor
+    # for backward compatibility with any cached HeteroData that expects the key.
+    data["word", "rev_contains", "doc"].edge_index = torch.empty((2, 0), dtype=torch.long)
 
     if word_word_src and graph_mode != "no_syntax":
         data["word", "relates", "word"].edge_index = torch.tensor(

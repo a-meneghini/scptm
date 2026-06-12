@@ -32,12 +32,24 @@ Vocabulary ──SBERT──► word embeddings ┘                             
 
 ## Installation
 
-```bash
-cd scptm          # directory containing setup.py
-pip install -e .
+**From PyPI:**
 
-# With comparison benchmarks (BERTopic, TriTopic)
-pip install -e ".[benchmark]"
+```bash
+pip install scptm
+
+# With comparison benchmarks (BERTopic, CTM)
+pip install "scptm[benchmark]"
+
+# All optional dependencies
+pip install "scptm[full]"
+```
+
+**For development (editable install):**
+
+```bash
+git clone https://github.com/a-meneghini/scptm.git
+cd scptm
+pip install -e ".[dev]"
 ```
 
 **Required spaCy models:**
@@ -46,6 +58,8 @@ pip install -e ".[benchmark]"
 python -m spacy download en_core_web_sm   # English
 python -m spacy download it_core_news_sm  # Italian
 ```
+
+> **Note on `torch-geometric`:** SCPTM depends on [PyTorch Geometric](https://pytorch-geometric.readthedocs.io) (`torch-geometric>=2.4`), which is available on standard PyPI. If you need CUDA-accelerated graph operations, install the CUDA-specific wheel first following the [official PyG installation guide](https://pytorch-geometric.readthedocs.io/en/stable/install/installation.html) before installing SCPTM. CPU-only installs work out of the box with `pip install scptm`.
 
 ---
 
@@ -193,7 +207,7 @@ dominant topic centroid. Useful when the initial embedding space lacks clear clu
 theta = model.fit(
     documents,
     iterative_refinement = True,
-    n_refinement_steps   = 3,     # allena → raffina → allena → ... (N volte)
+    n_refinement_steps   = 3,     # train → refine → train → ... (N steps)
     refinement_blend     = 0.2,   # alpha: 0 = no blend, 1 = full centroid
 ).theta
 ```
@@ -319,7 +333,7 @@ Score in [0, 1]; > 0.70 is generally considered good.
   author  = {Meneghini, Alessandro},
   title   = {{SCPTM}: Structural Contextual Probabilistic Topic Model},
   year    = {2026},
-  url     = {https://github.com/alemeneghini/scptm}
+  url     = {https://github.com/a-meneghini/scptm}
 }
 ```
 

@@ -210,6 +210,8 @@ class SCPTM:
             emb_dim, cfg.hidden_channels, cfg.num_topics,
             len(self._vocab), graph_mode=cfg.graph_mode,
             beta_temperature=cfg.beta_temperature,
+            trainable_word_embeddings=cfg.trainable_word_embeddings,
+            encoder_residual=cfg.encoder_residual,
         ).to(self._device)
 
         # ---- 6b. K-means initialisation of topic embeddings ----
@@ -248,6 +250,15 @@ class SCPTM:
             )
         except Exception as e:  # pragma: no cover
             print(f"  [WARN] K-means init failed ({e}); using random init.")
+
+        # ---- 6c. Initialise trainable word embeddings from SBERT ----
+        # word_embeddings starts as zeros; copying SBERT vectors gives the
+        # model a strong semantic prior from epoch 1 while allowing gradients
+        # to adapt them to corpus co-occurrence statistics.
+        if cfg.trainable_word_embeddings and self._nn.word_embeddings is not None:
+            with torch.no_grad():
+                self._nn.word_embeddings.data.copy_(self._static_word_embs)
+            print("  Trainable word embeddings initialised from SBERT.")
 
         # ---- 7. Training (+ optional iterative refinement) ----
         if iterative_refinement and n_refinement_steps > 0:

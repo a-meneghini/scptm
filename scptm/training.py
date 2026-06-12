@@ -46,6 +46,46 @@ from torch_geometric.data import HeteroData
 from torch_geometric.loader import NeighborLoader
 from tqdm import tqdm
 
+
+# ---------------------------------------------------------------------------
+# PPMI matrix helper (for differentiable NPMI coherence loss)
+# ---------------------------------------------------------------------------
+
+def compute_ppmi_tensor(
+    bow_csr,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Compute a dense Positive PMI matrix from a BoW sparse matrix.
+
+    PPMI[i, j] = max(0, log P(i,j) / (P(i)*P(j)))
+    where co-occurrence is measured at the document level.
+
+    Note: returns a (V, V) dense tensor — memory-intensive for large V.
+    Only call this when npmi_coherence_weight > 0.
+
+    Parameters
+    ----------
+    bow_csr : scipy sparse matrix, shape (n_docs, V)
+    device  : target torch device
+
+    Returns
+    -------
+    ppmi : torch.Tensor, shape (V, V), on `device`
+    """
+    n_docs = bow_csr.shape[0]
+    bow_bin = (bow_csr > 0).astype(np.float32)
+    # Co-occurrence: C[i,j] = # docs containing both word i and word j
+    cooc = (bow_bin.T @ bow_bin).toarray()          # (V, V)
+    p_w = cooc.diagonal() / n_docs                  # P(w)
+    p_joint = cooc / n_docs                         # P(wi, wj)
+    outer = np.outer(p_w, p_w)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        pmi = np.where(outer > 0, np.log(p_joint / (outer + 1e-10) + 1e-10), 0.0)
+    ppmi = np.maximum(pmi, 0.0)
+    np.fill_diagonal(ppmi, 0.0)
+    return torch.tensor(ppmi, dtype=torch.float32, device=device)
+
 from .config import SCPTMConfig
 from .nn import VariationalGraphTopicModel
 
@@ -114,16 +154,14 @@ def _compute_loss(
     cfg: SCPTMConfig,
     device: torch.device,
     static_word_embs: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    ppmi_tensor: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Compute ELBO loss for a mini-batch.
-
-    Uses decode_train() so that the reconstruction loss propagates gradients
-    to topic_embeddings via the differentiable beta.  [FIX-4]
+    Compute ELBO loss for a mini-batch, plus optional coherence terms.
 
     Returns
     -------
-    recon_loss, kl_loss : scalar tensors
+    recon_loss, kl_loss, we_coh_loss, npmi_coh_loss : scalar tensors
     """
     B = len(batch_indices)
     idx_np = batch_indices.cpu().numpy()
@@ -133,7 +171,7 @@ def _compute_loss(
     theta_d = F.softmax(z, dim=-1)
     recon_probs = model.decode_train(theta_d, static_word_embs)     # (B, V)
 
-    # ---- BoW target  [FIX-1] ----
+    # ---- BoW target ----
     bow_raw = torch.tensor(
         bow_sparse[idx_np].toarray(), dtype=torch.float32, device=device
     )
@@ -148,7 +186,19 @@ def _compute_loss(
         kl_per_dim = torch.clamp(kl_per_dim, min=cfg.free_bits)
     kl_loss = kl_per_dim.sum() / B
 
-    return recon_loss, kl_loss
+    # ---- Optional: WE-coherence loss ----
+    if cfg.we_coherence_weight > 0.0:
+        we_coh_loss = model.we_coherence_loss(static_word_embs)
+    else:
+        we_coh_loss = torch.tensor(0.0, device=device)
+
+    # ---- Optional: NPMI coherence loss ----
+    if cfg.npmi_coherence_weight > 0.0 and ppmi_tensor is not None:
+        npmi_coh_loss = model.npmi_coherence_loss(ppmi_tensor, static_word_embs)
+    else:
+        npmi_coh_loss = torch.tensor(0.0, device=device)
+
+    return recon_loss, kl_loss, we_coh_loss, npmi_coh_loss
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +256,13 @@ def train(
         "coherence_npmi": [], "topic_diversity": [], "metric_epochs": [],
     }
 
+    # Pre-compute PPMI tensor if NPMI coherence loss is enabled.
+    # This is a one-time O(n_docs * V) operation; skipped when weight == 0.
+    ppmi_tensor: Optional[torch.Tensor] = None
+    if cfg.npmi_coherence_weight > 0.0:
+        print("  Pre-computing PPMI matrix for coherence loss...")
+        ppmi_tensor = compute_ppmi_tensor(bow_csr, device)
+
     # Build NeighborLoader once if requested
     use_loader = cfg.use_neighbor_sampling and cfg.graph_mode != "none"
     loader = None
@@ -229,10 +286,22 @@ def train(
         kl_weight = compute_kl_weight(
             epoch, cfg.kl_warmup_epochs, cfg.kl_max, cfg.kl_strategy
         )
+
+        # ---- Adaptive KL boost (anti-collapse) ----
+        # When topic entropy is below threshold (topics collapsing), temporarily
+        # increase KL weight to push the posterior back towards the prior.
+        if cfg.adaptive_kl and model._cached_beta is not None:
+            with torch.no_grad():
+                beta = model._cached_beta                            # (K, V)
+                entropy = -(beta * torch.log(beta + 1e-10)).sum(dim=-1).mean()
+                if entropy.item() < cfg.min_topic_entropy:
+                    kl_weight = min(kl_weight + cfg.adaptive_kl_boost,
+                                    cfg.kl_max * 2.0)
+
         epoch_loss = epoch_recon = epoch_kl = 0.0
         num_batches = 0
 
-        # ---- [FIX-2] Refresh beta at start of epoch (full recompute) ----
+        # ---- Refresh beta at start of epoch ----
         if epoch % cfg.beta_refresh_epochs == 0:
             model.compute_contextual_beta(ctx_embs_list, static_word_embs)
 
@@ -245,19 +314,20 @@ def train(
                 with torch.amp.autocast("cuda", enabled=(scaler is not None)):
                     mu, logvar = model.encode(batch.x_dict, batch.edge_index_dict)
                     doc_indices = batch["doc"].n_id
-                    recon_loss, kl_loss = _compute_loss(
+                    recon_loss, kl_loss, we_loss, npmi_loss = _compute_loss(
                         model, mu, logvar, doc_indices, bow_csr, cfg, device,
-                        static_word_embs,
+                        static_word_embs, ppmi_tensor,
                     )
                     div_loss = model.topic_diversity_loss()
                     loss = (
                         recon_loss
                         + kl_weight * kl_loss
                         + cfg.topic_diversity_weight * div_loss
+                        + cfg.we_coherence_weight   * we_loss
+                        + cfg.npmi_coherence_weight * npmi_loss
                     )
 
                 _backward(loss, optimizer, scaler, model)
-                # [FIX-2] mark beta stale after weight update
                 model.invalidate_beta()
 
                 epoch_loss  += loss.item()
@@ -277,21 +347,22 @@ def train(
                 optimizer.zero_grad()
 
                 with torch.amp.autocast("cuda", enabled=(scaler is not None)):
-                    # [FIX-1] encoder always goes through model.encode
                     mu, logvar = model.encode(
                         graph_data.x_dict, graph_data.edge_index_dict
                     )
                     mu_b     = mu[batch_indices]
                     logvar_b = logvar[batch_indices]
-                    recon_loss, kl_loss = _compute_loss(
+                    recon_loss, kl_loss, we_loss, npmi_loss = _compute_loss(
                         model, mu_b, logvar_b, batch_indices, bow_csr, cfg, device,
-                        static_word_embs,
+                        static_word_embs, ppmi_tensor,
                     )
                     div_loss = model.topic_diversity_loss()
                     loss = (
                         recon_loss
                         + kl_weight * kl_loss
                         + cfg.topic_diversity_weight * div_loss
+                        + cfg.we_coherence_weight   * we_loss
+                        + cfg.npmi_coherence_weight * npmi_loss
                     )
 
                 _backward(loss, optimizer, scaler, model)

@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP"]
+ignore = ["E501"]   # long lines tolerated in docstrings
+
+[tool.mypy]
+python_version = "3.9"
+ignore_missing_imports = true
+warn_return_any = false
+
+# smoke_test.py is a standalone validation script, not a pytest suite.
+# Run it directly: python smoke_test.py
+# A pytest-compatible test suite can be added under tests/ in a future release.

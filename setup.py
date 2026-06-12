@@ -17,7 +17,7 @@ setup(
     name="scptm",
     version="0.2.0",
     author="Alessandro Meneghini",
-    author_email="",
+    author_email="alessandro.meneghini@uniud.it",
     description=(
         "SCPTM: Structural Contextual Probabilistic Topic Model — "
         "a VAE-GNN topic model with syntactic dependency graphs, "
@@ -25,7 +25,7 @@ setup(
     ),
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/alemeneghini/scptm",
+    url="https://github.com/a-meneghini/scptm",
     packages=find_packages(),
     python_requires=">=3.9",
     install_requires=[
@@ -45,11 +45,15 @@ setup(
     extras_require={
         "benchmark": [
             "bertopic>=0.15",
-            "tritopic>=2.3",
+            "contextualized-topic-models>=2.3",
+            "vaderSentiment>=3.3",
+            "gensim>=4.3",
         ],
         "full": [
             "bertopic>=0.15",
-            "tritopic>=2.3",
+            "contextualized-topic-models>=2.3",
+            "vaderSentiment>=3.3",
+            "gensim>=4.3",
             "pacmap>=0.7",
         ],
         "dev": [
