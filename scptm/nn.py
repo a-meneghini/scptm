@@ -7,7 +7,14 @@ Classes
 -------
 VariationalGraphEncoder
     Encodes document embeddings to (μ, logσ²) in topic space.
-    Graph modes use a 1-layer HeteroConv/GAT (2 heads).
+    Graph modes use a 1-layer HeteroConv/GAT (2 heads) over three edge
+    types: doc→word (contains), word→word (relates, syntactic deps),
+    and word→doc (rev_contains). The doc representation is the residual
+    projection of the raw SBERT doc embedding plus the rev_contains
+    signal scaled by a learnable sigmoid gate (word_to_doc_gate, init
+    ≈0.047) — this lets training decide how much graph/syntax context
+    to mix in, avoiding the over-smoothing regression seen with an
+    unweighted merge.
     Mode 'none' uses a 2-layer MLP over document features only.
 
 VariationalGraphTopicModel
@@ -44,7 +51,7 @@ Design notes
   encoder and decoder are always in sync.
 """
 
-import warnings
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -94,33 +101,36 @@ class VariationalGraphEncoder(nn.Module):
                 nn.ReLU(),
             )
         else:
-            # NOTE: word→doc (rev_contains) removed — it propagated word
-            # representations back into doc nodes, causing over-smoothing
-            # and degrading NMI. Doc nodes are updated via the residual
-            # connection below instead.
-            # Suppress the PyG warning about doc nodes not being updated
-            # by message passing — intentional, handled by residual_proj.
-            with warnings.catch_warnings():
-                warnings.filterwarnings(
-                    "ignore", "There exist node types"
-                )
-                self.conv = HeteroConv(
-                    {
-                        ("doc",  "contains", "word"): GATConv(
-                            (in_channels, in_channels), hidden_channels,
-                            heads=2, add_self_loops=False
-                        ),
-                        ("word", "relates",  "word"): GATConv(
-                            in_channels, hidden_channels,
-                            heads=2, add_self_loops=False
-                        ),
-                    },
-                    aggr="mean",
-                )
+            # word→doc (rev_contains) feeds syntactic/graph context back into
+            # doc nodes. A naive equal-weight merge with the residual caused
+            # over-smoothing (NMI regression) in earlier experiments, so the
+            # contribution is scaled by a learnable, sigmoid-gated scalar
+            # (word_to_doc_gate) initialised near 0: at the start of training
+            # the doc representation is essentially the residual alone, and
+            # gradient descent opens the gate only if the graph signal
+            # actually helps the reconstruction/KL objective.
+            self.conv = HeteroConv(
+                {
+                    ("doc",  "contains",     "word"): GATConv(
+                        (in_channels, in_channels), hidden_channels,
+                        heads=2, add_self_loops=False
+                    ),
+                    ("word", "relates",      "word"): GATConv(
+                        in_channels, hidden_channels,
+                        heads=2, add_self_loops=False
+                    ),
+                    ("word", "rev_contains", "doc"):  GATConv(
+                        (in_channels, in_channels), hidden_channels,
+                        heads=2, add_self_loops=False
+                    ),
+                },
+                aggr="mean",
+            )
             # Residual projection: maps raw doc input to gat_out dim so it
             # can be added to the GAT output, preserving document identity.
             if encoder_residual:
                 self.residual_proj = nn.Linear(in_channels, gat_out, bias=False)
+                self.word_to_doc_gate = nn.Parameter(torch.tensor(-3.0))
 
         self.mu_layer     = nn.Linear(gat_out, num_topics)
         self.logvar_layer = nn.Linear(gat_out, num_topics)
@@ -136,19 +146,18 @@ class VariationalGraphEncoder(nn.Module):
         else:
             h_dict = self.conv(x_dict, edge_index_dict)
             h_dict = {k: F.leaky_relu(v) for k, v in h_dict.items()}
-            # After removing rev_contains, doc nodes are no longer updated by
-            # HeteroConv. Use the residual projection of the raw doc input as
-            # the doc representation, optionally adding word-side context via
-            # any future doc-targeting relation.
             doc_input = x_dict["doc"]
             if self.encoder_residual:
+                # Doc representation = residual (raw SBERT doc embedding) +
+                # gated syntactic/graph signal aggregated from word nodes.
                 h = self.residual_proj(doc_input)
-                # Add word→doc signal if present (e.g. from future relations)
                 if "doc" in h_dict:
-                    h = h + h_dict["doc"]
+                    gate = torch.sigmoid(self.word_to_doc_gate)
+                    h = h + gate * h_dict["doc"]
             else:
-                h = h_dict.get("doc", self.residual_proj(doc_input)
-                               if hasattr(self, "residual_proj") else doc_input)
+                # Pure message passing, no residual: doc representation comes
+                # entirely from the word→doc aggregated signal.
+                h = h_dict["doc"]
         return self.mu_layer(h), self.logvar_layer(h)
 
 
@@ -180,6 +189,7 @@ class VariationalGraphTopicModel(nn.Module):
         beta_temperature: float = 0.1,
         trainable_word_embeddings: bool = True,
         encoder_residual: bool = True,
+        n_covariates: int = 0,
     ):
         super().__init__()
         self.num_topics                = num_topics
@@ -187,10 +197,20 @@ class VariationalGraphTopicModel(nn.Module):
         self.graph_mode                = graph_mode
         self.beta_temperature          = beta_temperature
         self.trainable_word_embeddings = trainable_word_embeddings
+        self.n_covariates              = n_covariates
 
         self.encoder = VariationalGraphEncoder(
             in_channels, hidden_channels, num_topics, graph_mode,
             encoder_residual=encoder_residual,
+        )
+
+        # STM-style prevalence prior: maps covariate vector to a shift of
+        # the KL prior mean in topic space.  When n_covariates=0 this is
+        # None and the standard N(0, I) prior is used.
+        self.cov_to_prior = (
+            nn.Linear(n_covariates, num_topics, bias=True)
+            if n_covariates > 0
+            else None
         )
 
         # Learnable topic vectors in embedding space.
@@ -218,9 +238,22 @@ class VariationalGraphTopicModel(nn.Module):
     # Reparameterisation
     # ------------------------------------------------------------------
 
-    def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-        """Standard Gaussian reparameterisation."""
-        if self.training:
+    def reparameterize(
+        self, mu: torch.Tensor, logvar: torch.Tensor, sample: Optional[bool] = None,
+    ) -> torch.Tensor:
+        """
+        Standard Gaussian reparameterisation.
+
+        sample=None (default) follows self.training — stochastic during
+        train(), deterministic (returns mu) during eval(). Pass sample=True
+        explicitly to force a real stochastic draw regardless of train/eval
+        mode: MC uncertainty estimation samples during inference, which
+        otherwise runs the model in eval() — without this override every
+        "MC sample" silently collapses to the same mu and reported
+        uncertainty is always exactly zero.
+        """
+        do_sample = self.training if sample is None else sample
+        if do_sample:
             return mu + torch.exp(0.5 * logvar) * torch.randn_like(mu)
         return mu
 
@@ -284,6 +317,27 @@ class VariationalGraphTopicModel(nn.Module):
     def encode(self, x_dict: dict, edge_index_dict: dict):
         """Encode documents to (mu, logvar)."""
         return self.encoder(x_dict, edge_index_dict)
+
+    def compute_prior_mean(
+        self,
+        covariate_tensor: "torch.Tensor",
+    ) -> "Optional[torch.Tensor]":
+        """
+        Compute the covariate-informed KL prior mean Γ·x.
+
+        Returns None when no covariate layer is present (standard N(0,I) prior).
+
+        Parameters
+        ----------
+        covariate_tensor : Tensor, shape (N, n_covariates)
+
+        Returns
+        -------
+        prior_mu : Tensor, shape (N, K) or None
+        """
+        if self.cov_to_prior is None:
+            return None
+        return self.cov_to_prior(covariate_tensor)   # (N, K)
 
     def decode_train(
         self,

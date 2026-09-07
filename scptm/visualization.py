@@ -222,7 +222,7 @@ def view_semantic_2d_paper(
                  color="black", ha="center", va="top", zorder=5,
                  bbox=dict(facecolor="white", alpha=0.8, edgecolor="none", pad=2))
 
-    plt.title("UMAP 2D Semantic Space + Topics", fontsize=16, fontweight="bold", pad=20)
+    plt.title("UMAP 2D Semantic Space with Topics", fontsize=16, fontweight="bold", pad=20)
     plt.axis("off")
     plt.tight_layout()
     plt.savefig(save_path, format="png", bbox_inches="tight", dpi=300)

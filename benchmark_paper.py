@@ -61,9 +61,12 @@ Google Colab quick-start
 
 # ── Standard library ─────────────────────────────────────────────────────────
 import os
+import threading
+import time
 import warnings
 from itertools import combinations
 from pathlib import Path
+from typing import Optional, Tuple
 
 # ── Third-party ──────────────────────────────────────────────────────────────
 import numpy as np
@@ -130,6 +133,53 @@ EPOCHS = 50
 # Top-k words saved per topic — identical for every model
 TOP_K_WORDS = 10
 
+
+class _MemSampler:
+    """
+    Background host-RAM sampler for a single (model, K, seed) run.
+
+    ru_maxrss (resource module) reports a process-lifetime running max, not a
+    per-call peak — reusing it across hundreds of runs in one long process
+    would just report the largest run seen so far, not THIS run's usage. This
+    instead polls psutil.Process().memory_info().rss on a timer during the
+    `with` block, so peak_mb reflects only the wrapped run.
+
+    psutil is optional: if unavailable, peak_mb stays NaN (graceful, same
+    degrade-on-missing-dependency style as the rest of paper_metrics.py).
+    """
+
+    def __init__(self, interval: float = 0.5):
+        self.interval = interval
+        self.peak_mb = float("nan")
+        self._stop = threading.Event()
+        self._thread = None
+        try:
+            import psutil
+            self._proc = psutil.Process()
+        except ImportError:
+            self._proc = None
+
+    def _poll(self):
+        while not self._stop.is_set():
+            try:
+                rss_mb = self._proc.memory_info().rss / 1024**2
+                self.peak_mb = rss_mb if self.peak_mb != self.peak_mb else max(self.peak_mb, rss_mb)
+            except Exception:
+                pass
+            self._stop.wait(self.interval)
+
+    def __enter__(self):
+        if self._proc is not None:
+            self.peak_mb = self._proc.memory_info().rss / 1024**2
+            self._thread = threading.Thread(target=self._poll, daemon=True)
+            self._thread.start()
+        return self
+
+    def __exit__(self, *exc_info):
+        if self._thread is not None:
+            self._stop.set()
+            self._thread.join(timeout=2)
+
 # ── Model roster (7) ──────────────────────────────────────────────────────────
 # Maps benchmark model name → SCPTM graph_mode (None for non-SCPTM models).
 SCPTM_MODES = {
@@ -152,8 +202,10 @@ METRIC_COLUMNS = [
     "mwe_compactness", "mwe_specificity", "mwe_complementarity",
     "mwe_content_ratio",                                      # C
     "mwe_valence", "unigram_valence", "valence_gap",
+    "mwe_valence_tf", "unigram_valence_tf", "valence_gap_tf",
     "stance_concentration",                                   # D
     "nmi",                                                    # extrinsic
+    "runtime_sec", "peak_cpu_memory_mb", "peak_gpu_memory_mb", # resource usage
 ]
 
 # ── RQ3-D stance classifier ───────────────────────────────────────────────────
@@ -472,14 +524,54 @@ def load_eu_debates(max_docs: int = 20_000, seed: int = 42):
     docs : list[str]
     """
     print("\n[Corpus] Loading EU Debates (English-native only) …")
-    from datasets import load_dataset
+    # coastalcph/eu_debates only ships a legacy datasets loading SCRIPT
+    # (eu_debates.py over eu_debates.zip) — datasets>=3.0 refuses to execute
+    # dataset scripts at all (removed outright, not gated behind
+    # trust_remote_code anymore), and this repo has no parquet
+    # auto-conversion either (no refs/convert/parquet branch). So we
+    # download+parse the raw zip ourselves, replicating what the script did:
+    # read train.jsonl, keep speaker_role == "MEP".
+    import json
+    import zipfile
+    from huggingface_hub import hf_hub_download
 
-    ds = load_dataset("coastalcph/eu_debates", split="train")
-    df = ds.to_pandas()
+    zip_path = hf_hub_download(
+        repo_id="coastalcph/eu_debates", filename="eu_debates.zip",
+        repo_type="dataset",
+    )
+    rows = []
+    with zipfile.ZipFile(zip_path) as zf:
+        # Exclude macOS resource-fork junk (__MACOSX/._train.jsonl) — its name
+        # also ends in "train.jsonl" via string suffix match, so a naive
+        # endswith() filter can pick either file depending on zip entry order.
+        jsonl_names = [
+            n for n in zf.namelist()
+            if n.endswith(".jsonl") and "__MACOSX" not in n
+        ]
+        if not jsonl_names:
+            raise RuntimeError(
+                f"No .jsonl found in eu_debates.zip (contents: {zf.namelist()})"
+            )
+        name = next((n for n in jsonl_names if n.endswith("train.jsonl")),
+                    jsonl_names[0])
+        with zf.open(name) as f:
+            for line in f:
+                if line.strip():
+                    rows.append(json.loads(line))
+    df = pd.DataFrame(rows)
+    if "speaker_role" in df.columns:
+        df = df[df["speaker_role"] == "MEP"]
 
     def _is_english_native(row) -> bool:
+        # pd.DataFrame(rows) from a list of dicts coerces missing values in a
+        # mixed None/str column to NaN (float), not None — `tt is None` alone
+        # misses every genuinely-missing row once real strings are present in
+        # the same column, silently zeroing out the whole English-native
+        # subset. pd.isna() catches both None and NaN.
         tt = row.get("translated_text", None)
-        return tt is None or (isinstance(tt, str) and tt.strip() == "")
+        if pd.isna(tt):
+            return True
+        return isinstance(tt, str) and tt.strip() == ""
 
     df = df[df.apply(_is_english_native, axis=1)].copy()
     docs = df["text"].dropna().astype(str).tolist()
@@ -844,6 +936,7 @@ def run_scptm_variant(
             valid_docs, model._nn, model._vocab,
             model._static_word_embs, model._sbert, model._stop,
             top_k=top_k, min_df=min_df,
+            dep_triples=model._dep_triples,
         )
         mwe_phrases    = [topics_dict[f"Topic_{k+1}"]["phrases"] for k in range(K)]
         single_phrases = [topics_dict[f"Topic_{k+1}"]["single"]  for k in range(K)]
@@ -851,6 +944,94 @@ def run_scptm_variant(
         print(f"  [WARN] MWE extraction failed: {e}")
 
     return topic_words, theta, doc_mask, mwe_phrases, single_phrases
+
+
+def extract_generic_mwe(
+    bigram_texts: list,
+    theta: np.ndarray,
+    doc_mask: Optional[np.ndarray],
+    top_k: int = TOP_K_WORDS,
+    min_df: int = 5,
+) -> Tuple[Optional[list], Optional[list]]:
+    """
+    Bigram-based MWE + unigram extraction for models with no native MWE
+    mechanism (LDA, CTM, BERTopic) — gives them a comparable "phrases vs
+    single words" split so mwe_vs_unigram_valence (and the other C-family
+    MWE-quality metrics) aren't SCPTM-only, and the RQ3 signal is checked
+    against a real baseline instead of only ever being measured for SCPTM.
+
+    Candidates come from the SAME gensim-Phrases bigram corpus already built
+    once per corpus for LDA training (bigram_texts) — a statistical
+    co-occurrence source, not a syntactic one, which is the honest baseline
+    for models without a dependency graph. Ranked per-topic by c-TF-IDF
+    (compute_ctfidf_scores), the same ranking principle SCPTM itself uses for
+    method="ctfidf" — so the comparison is apples-to-apples on the ranking
+    side, differing only in candidate *source*.
+
+    Returns (None, None) if theta is unavailable or extraction fails, so the
+    caller's existing "mwe_per_topic is None → skip family C" logic still
+    applies uniformly.
+    """
+    if theta is None:
+        return None, None
+    try:
+        from scptm.keywords import compute_ctfidf_scores
+
+        # theta already has ONE ROW PER SURVIVING DOCUMENT for every runner
+        # (LDA drops empty-BoW docs internally before inference; SCPTM drops
+        # <=10-char docs in prepare_corpus; CTM/BERTopic keep all and set
+        # doc_mask all-True) — it is never full-length-then-needs-masking.
+        # Only bigram_texts (built once from the full raw corpus) needs
+        # doc_mask applied to line up with theta's reduced row order/count.
+        texts = (
+            [t for t, m in zip(bigram_texts, doc_mask) if m]
+            if doc_mask is not None else bigram_texts
+        )
+        theta_aligned = theta
+        if len(texts) != theta_aligned.shape[0]:
+            return None, None
+
+        vectorizer = CountVectorizer(
+            min_df=min_df, token_pattern=r"(?u)\b\w[\w']*\b"
+        )
+        # bigram_texts entries are already space-joined strings (built once
+        # in build_bigram_corpus) — pass through as-is, don't re-join.
+        bow = vectorizer.fit_transform(texts)
+        vocab = vectorizer.get_feature_names_out()
+        K = theta_aligned.shape[1]
+        scores = compute_ctfidf_scores(
+            bow, torch.tensor(theta_aligned, dtype=torch.float32), K
+        )
+
+        # CountVectorizer's own stop_words filtering only ever sees whole
+        # tokens — a gensim-Phrases bigram like "if_you" is ONE token, and
+        # "if_you" (joined) isn't itself in any stopword list even though
+        # "if" and "you" both are, so junk like "if_you"/"i_am"/"would_be"
+        # survives untouched (confirmed in words_20NG.csv: CTM/LDA phrases
+        # were dominated by these; SCPTM's own n-gram fallback in
+        # keywords.extract_separated_topics doesn't have this hole because
+        # it filters on raw un-joined text before ever forming n-grams).
+        # Drop any candidate — single word or bigram half — that is a
+        # stopword.
+        mwe_per_topic, single_per_topic = [], []
+        for k in range(K):
+            mwe, single = [], []
+            for i in np.argsort(scores[k])[::-1]:
+                w = vocab[i]
+                parts = w.split("_")
+                if any(p in _STOP_SET for p in parts):
+                    continue
+                bucket = mwe if "_" in w else single
+                if len(bucket) < top_k:
+                    bucket.append(w.replace("_", " "))
+                if len(mwe) >= top_k and len(single) >= top_k:
+                    break
+            mwe_per_topic.append(mwe)
+            single_per_topic.append(single)
+        return mwe_per_topic, single_per_topic
+    except Exception as e:
+        print(f"  [WARN] generic MWE extraction failed: {e}")
+        return None, None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1067,60 +1248,93 @@ def run_corpus_sweep(
                 doc_mask = None
                 mwe_phrases = None
                 single_phrases = None
-                try:
-                    if model_name == "LDA":
-                        topic_words, theta, doc_mask = run_lda(
-                            docs, K, seed, min_df, bigram_texts=bigram_texts)
 
-                    elif model_name == "CTM":
-                        topic_words, theta, doc_mask = run_ctm_vanilla(
-                            docs, K, seed, sbert_embs, min_df)
+                # Resource usage covers the whole row — training AND
+                # evaluation (stance/valence classifiers aren't free either) —
+                # and is recorded even on a failed/errored run, so a crash
+                # still tells you how long it ran / how much it used before
+                # dying (useful for spotting the OOM candidate in a sweep).
+                if torch.cuda.is_available():
+                    torch.cuda.reset_peak_memory_stats()
+                t0 = time.perf_counter()
 
-                    elif model_name in SCPTM_MODES:
-                        topic_words, theta, doc_mask, mwe_phrases, single_phrases = \
-                            run_scptm_variant(
-                                docs, K, seed, SCPTM_MODES[model_name],
-                                cache_path, min_df)
+                with _MemSampler() as mem_sampler:
+                    try:
+                        if model_name == "LDA":
+                            topic_words, theta, doc_mask = run_lda(
+                                docs, K, seed, min_df, bigram_texts=bigram_texts)
 
-                    elif model_name == "BERTopic":
-                        topic_words, theta, doc_mask = run_bertopic(
-                            docs, K, seed, sbert_embs, min_df)
+                        elif model_name == "CTM":
+                            topic_words, theta, doc_mask = run_ctm_vanilla(
+                                docs, K, seed, sbert_embs, min_df)
 
-                    # Subset true_labels to only the docs the model actually saw,
-                    # avoiding "inconsistent number of samples" NMI errors.
-                    aligned_labels = None
-                    if true_labels is not None and doc_mask is not None:
-                        aligned_labels = np.array(true_labels)[doc_mask]
-                    elif true_labels is not None:
-                        aligned_labels = true_labels
+                        elif model_name in SCPTM_MODES:
+                            topic_words, theta, doc_mask, mwe_phrases, single_phrases = \
+                                run_scptm_variant(
+                                    docs, K, seed, SCPTM_MODES[model_name],
+                                    cache_path, min_df)
 
-                    metrics = evaluate_all(
-                        topic_words, bow_ref, vocab_ref, sbert,
-                        tokenized_texts=tokenized_texts,
-                        df_lookup=df_lookup,
-                        theta=theta,
-                        doc_mask=doc_mask,
-                        doc_embeddings_full=sbert_embs,
-                        true_labels=aligned_labels,
-                        mwe_per_topic=mwe_phrases,
-                        single_per_topic=single_phrases,
-                        raw_docs=docs,
-                        run_stance=(RUN_STANCE and seed in STANCE_SEEDS),
-                    )
+                        elif model_name == "BERTopic":
+                            topic_words, theta, doc_mask = run_bertopic(
+                                docs, K, seed, sbert_embs, min_df)
 
-                except Exception as exc:
-                    print(f"  [ERROR] {model_name} K={K} seed={seed}: {exc}")
-                    import traceback; traceback.print_exc()
-                    metrics     = dict(npmi=np.nan, c_v=np.nan, c_npmi=np.nan,
-                                       we_coherence=np.nan, diversity=np.nan,
-                                       quality=np.nan)
-                    topic_words = []   # nothing to save for words CSV
+                        # Non-SCPTM models have no native MWE mechanism — give them
+                        # a bigram/c-TF-IDF baseline so mwe_vs_unigram_valence (and
+                        # the rest of family C) is measured against a real baseline
+                        # instead of only ever existing for SCPTM.
+                        if mwe_phrases is None and theta is not None:
+                            mwe_phrases, single_phrases = extract_generic_mwe(
+                                bigram_texts, theta, doc_mask,
+                                top_k=TOP_K_WORDS, min_df=min_df)
 
-                finally:
-                    # Free GPU memory between runs regardless of outcome
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    import gc; gc.collect()
+                        # Subset true_labels to only the docs the model actually saw,
+                        # avoiding "inconsistent number of samples" NMI errors.
+                        aligned_labels = None
+                        if true_labels is not None and doc_mask is not None:
+                            aligned_labels = np.array(true_labels)[doc_mask]
+                        elif true_labels is not None:
+                            aligned_labels = true_labels
+
+                        metrics = evaluate_all(
+                            topic_words, bow_ref, vocab_ref, sbert,
+                            tokenized_texts=tokenized_texts,
+                            df_lookup=df_lookup,
+                            theta=theta,
+                            doc_mask=doc_mask,
+                            doc_embeddings_full=sbert_embs,
+                            true_labels=aligned_labels,
+                            mwe_per_topic=mwe_phrases,
+                            single_per_topic=single_phrases,
+                            raw_docs=docs,
+                            run_stance=(RUN_STANCE and seed in STANCE_SEEDS),
+                        )
+
+                    except Exception as exc:
+                        print(f"  [ERROR] {model_name} K={K} seed={seed}: {exc}")
+                        import traceback; traceback.print_exc()
+                        metrics     = dict(npmi=np.nan, c_v=np.nan, c_npmi=np.nan,
+                                           we_coherence=np.nan, diversity=np.nan,
+                                           quality=np.nan)
+                        topic_words = []   # nothing to save for words CSV
+
+                    finally:
+                        # Free GPU memory between runs regardless of outcome
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        import gc; gc.collect()
+
+                # mem_sampler.peak_mb is finalized once the `with` block above
+                # exits (its background thread has stopped); read it after,
+                # not inside, so it reflects the run's true final peak.
+                metrics["runtime_sec"] = time.perf_counter() - t0
+                metrics["peak_cpu_memory_mb"] = mem_sampler.peak_mb
+                metrics["peak_gpu_memory_mb"] = (
+                    torch.cuda.max_memory_allocated() / 1024**2
+                    if torch.cuda.is_available() else float("nan")
+                )
+                print(f"    [resource] {metrics['runtime_sec']:.1f}s"
+                      f" | CPU peak {metrics['peak_cpu_memory_mb']:.0f} MB"
+                      f" | GPU peak {metrics['peak_gpu_memory_mb']:.0f} MB")
 
                 # Reindex to the canonical schema so every row has identical
                 # columns regardless of which metrics the model produced.
@@ -1321,27 +1535,126 @@ def plot_qualitative(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Optional re-chunking (--chunk-chars)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _chunk_docs(docs: list, labels, max_chars: int):
+    """
+    Split each document into <=max_chars segments, applied uniformly to
+    whichever model runs next (LDA/CTM/BERTopic/SCPTM all see the same
+    chunked corpus) — keeps the cross-model comparison fair at the new
+    granularity instead of only re-chunking for SCPTM.
+
+    Uses scptm.graph.prepare_corpus's own chunking algorithm (not a
+    reimplementation), so a chunked benchmark run splits documents exactly
+    the same way SCPTM's own apply_chunking=True path would.
+
+    labels (if given) are propagated from each chunk's source document —
+    a chunk's ground-truth label is its parent document's label — so NMI
+    against true_labels stays valid at chunk granularity.
+
+    Returns (chunked_docs, chunked_labels_or_None).
+    """
+    chunked_docs, doc_indices = prepare_corpus(
+        docs, source_type="list", apply_chunking=True,
+        max_chunk_chars=max_chars, return_doc_indices=True,
+    )
+    chunked_labels = None
+    if labels is not None:
+        chunked_labels = np.asarray(labels)[doc_indices]
+    print(f"  [Chunking] max_chunk_chars={max_chars}: "
+          f"{len(docs):,} docs -> {len(chunked_docs):,} chunks")
+    return chunked_docs, chunked_labels
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pre-flight corpus check
+# ─────────────────────────────────────────────────────────────────────────────
+
+def preflight_check_corpora() -> bool:
+    """
+    Load all four corpora, with the exact same call each gets in main(),
+    before the sweep starts. Catches a broken loader (deprecated dataset
+    script, missing CSV, network failure, silently-empty filter — see the
+    eu_debates.py removal and the pd.isna English-native bug this caught)
+    in minutes instead of after hours of GPU training on the corpora that
+    come earlier in the sequence than the broken one.
+
+    Returns True iff all four load with a non-empty document list.
+    """
+    checks = [
+        ("20 Newsgroups",   lambda: load_20newsgroups()[0]),
+        ("EU Debates",      lambda: load_eu_debates(max_docs=20_000)),
+        ("Reddit Politics", lambda: load_reddit_politics(REDDIT_CSV)[0]),
+        ("Hate Speech",     lambda: load_hate_speech(min_tokens=30)[0]),
+    ]
+    print("\n" + "=" * 65)
+    print("PRE-FLIGHT: loading all 4 corpora before starting the sweep")
+    print("=" * 65)
+    all_ok = True
+    for name, loader in checks:
+        try:
+            docs = loader()
+            n = len(docs)
+            ok = n > 0
+            print(f"  [{'OK' if ok else 'EMPTY'}] {name}: {n:,} documents")
+            all_ok = all_ok and ok
+        except Exception as e:
+            print(f"  [FAIL] {name}: {type(e).__name__}: {e}")
+            all_ok = False
+    print("=" * 65)
+    if all_ok:
+        print("All corpora OK — starting the full sweep.\n")
+    else:
+        print("One or more corpora failed pre-flight — aborting before the "
+              "sweep to avoid burning hours of compute on a run that would "
+              "crash partway through anyway. Fix the failing loader(s) above "
+              "and re-run.\n")
+    return all_ok
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
-def main():
+def main(chunk_chars: Optional[int] = None):
+    """
+    chunk_chars : None runs the baseline (whole documents, apply_chunking=
+    False semantics, as before). Set to e.g. 200/400/800 to instead split
+    every corpus into <=chunk_chars segments before ANY model sees them —
+    same chunking applied uniformly to LDA/CTM/BERTopic/SCPTM, so the
+    cross-model comparison stays fair at the new granularity. Writes to a
+    separate results_chunk{N}/ directory and chunk{N}-suffixed cache/corpus
+    names, so it never collides with (or overwrites) the baseline run.
+    """
+    global OUT_DIR
+    if chunk_chars:
+        OUT_DIR = Path(DRIVE_ROOT) / f"results_chunk{chunk_chars}"
+        OUT_DIR.mkdir(parents=True, exist_ok=True)
+    tag = f"_chunk{chunk_chars}" if chunk_chars else ""
+
+    if not preflight_check_corpora():
+        raise SystemExit(1)
+
     sbert = SentenceTransformer(SBERT_MODEL)
     all_raw = []
 
     # ── 1. 20 Newsgroups ─────────────────────────────────────────────────────
     print("\n" + "=" * 65)
-    print("CORPUS 1/4 — 20 Newsgroups  (K=20, with NMI ground truth)")
+    print(f"CORPUS 1/4 — 20 Newsgroups{tag}  (K=20, with NMI ground truth)")
     print("=" * 65)
 
     ng_docs, ng_labels, _ = load_20newsgroups()
+    if chunk_chars:
+        ng_docs, ng_labels = _chunk_docs(ng_docs, ng_labels, chunk_chars)
     ng_bigram, _           = build_bigram_corpus(ng_docs, min_count=5)
     ng_bow, ng_vocab       = build_reference_bow(ng_bigram, min_df=5)
-    ng_cache               = str(Path(DRIVE_ROOT) / "20ng_cache.pkl")
+    ng_cache               = str(Path(DRIVE_ROOT) / f"20ng{tag}_cache.pkl")
     ng_embs                = precompute_sbert_embeddings(
-                                ng_docs, str(Path(DRIVE_ROOT) / "20ng"))
+                                ng_docs, str(Path(DRIVE_ROOT) / f"20ng{tag}"))
 
     raw_ng = run_corpus_sweep(
-        "20NG", ng_docs, [K_NEWSGROUPS],
+        f"20NG{tag}", ng_docs, [K_NEWSGROUPS],
         ng_bow, ng_vocab, sbert,
         ng_cache, ng_embs,
         true_labels=ng_labels, min_df=5,
@@ -1350,18 +1663,20 @@ def main():
 
     # ── 2. EU Parliament Debates ─────────────────────────────────────────────
     print("\n" + "=" * 65)
-    print("CORPUS 2/4 — EU Parliament Debates  (English-native, K-sweep)")
+    print(f"CORPUS 2/4 — EU Parliament Debates{tag}  (English-native, K-sweep)")
     print("=" * 65)
 
     eu_docs  = load_eu_debates(max_docs=20_000)
+    if chunk_chars:
+        eu_docs, _ = _chunk_docs(eu_docs, None, chunk_chars)
     eu_bigram, _     = build_bigram_corpus(eu_docs, min_count=10)
     eu_bow, eu_vocab = build_reference_bow(eu_bigram, min_df=10)
-    eu_cache         = str(Path(DRIVE_ROOT) / "eudebates_cache.pkl")
+    eu_cache         = str(Path(DRIVE_ROOT) / f"eudebates{tag}_cache.pkl")
     eu_embs          = precompute_sbert_embeddings(
-                          eu_docs, str(Path(DRIVE_ROOT) / "eudebates"))
+                          eu_docs, str(Path(DRIVE_ROOT) / f"eudebates{tag}"))
 
     raw_eu = run_corpus_sweep(
-        "EU_Debates", eu_docs, K_RANGE,
+        f"EU_Debates{tag}", eu_docs, K_RANGE,
         eu_bow, eu_vocab, sbert,
         eu_cache, eu_embs,
         min_df=10,
@@ -1370,18 +1685,20 @@ def main():
 
     # ── 3. Reddit politics ───────────────────────────────────────────────────
     print("\n" + "=" * 65)
-    print("CORPUS 3/4 — Reddit Liberals vs Conservatives  (K-sweep)")
+    print(f"CORPUS 3/4 — Reddit Liberals vs Conservatives{tag}  (K-sweep)")
     print("=" * 65)
 
     rd_docs, rd_labels = load_reddit_politics(REDDIT_CSV)
+    if chunk_chars:
+        rd_docs, rd_labels = _chunk_docs(rd_docs, rd_labels, chunk_chars)
     rd_bigram, _       = build_bigram_corpus(rd_docs, min_count=5)
     rd_bow, rd_vocab   = build_reference_bow(rd_bigram, min_df=5)
-    rd_cache           = str(Path(DRIVE_ROOT) / "reddit_cache.pkl")
+    rd_cache           = str(Path(DRIVE_ROOT) / f"reddit{tag}_cache.pkl")
     rd_embs            = precompute_sbert_embeddings(
-                            rd_docs, str(Path(DRIVE_ROOT) / "reddit"))
+                            rd_docs, str(Path(DRIVE_ROOT) / f"reddit{tag}"))
 
     raw_rd = run_corpus_sweep(
-        "Reddit_Pol", rd_docs, K_RANGE,
+        f"Reddit_Pol{tag}", rd_docs, K_RANGE,
         rd_bow, rd_vocab, sbert,
         rd_cache, rd_embs,
         true_labels=rd_labels, min_df=5,
@@ -1390,21 +1707,23 @@ def main():
 
     # ── 4. Measuring Hate Speech ─────────────────────────────────────────────
     print("\n" + "=" * 65)
-    print("CORPUS 4/4 — Measuring Hate Speech  (K=8 fixed + K-sweep)")
+    print(f"CORPUS 4/4 — Measuring Hate Speech{tag}  (K=8 fixed + K-sweep)")
     print("=" * 65)
 
     hs_docs, hs_labels, hs_label_names = load_hate_speech(min_tokens=30)
+    if chunk_chars:
+        hs_docs, hs_labels = _chunk_docs(hs_docs, hs_labels, chunk_chars)
     hs_bigram, _       = build_bigram_corpus(hs_docs, min_count=5)
     hs_bow, hs_vocab   = build_reference_bow(hs_bigram, min_df=5)
-    hs_cache           = str(Path(DRIVE_ROOT) / "hatespeech_cache.pkl")
+    hs_cache           = str(Path(DRIVE_ROOT) / f"hatespeech{tag}_cache.pkl")
     hs_embs            = precompute_sbert_embeddings(
-                            hs_docs, str(Path(DRIVE_ROOT) / "hatespeech"))
+                            hs_docs, str(Path(DRIVE_ROOT) / f"hatespeech{tag}"))
 
     # K=8 matches the 8 ground-truth categories; also sweep for completeness
     hs_k_values = [8] + [k for k in K_RANGE if k != 8]
 
     raw_hs = run_corpus_sweep(
-        "HateSpeech", hs_docs, hs_k_values,
+        f"HateSpeech{tag}", hs_docs, hs_k_values,
         hs_bow, hs_vocab, sbert,
         hs_cache, hs_embs,
         true_labels=hs_labels, min_df=5,
@@ -1439,16 +1758,30 @@ def main():
     plot_k_curves(agg, metric="we_coherence_mean")
 
     # ── Qualitative: SCPTM-none vs SCPTM on EU Debates at K* ─────────────────
-    eu_agg    = agg[agg["corpus"] == "EU_Debates"]
+    eu_agg    = agg[agg["corpus"] == f"EU_Debates{tag}"]
     scptm_agg = eu_agg[eu_agg["model"] == "SCPTM"]
     k_star    = int(scptm_agg.loc[scptm_agg["quality_mean"].idxmax(), "K"])
-    print(f"\nQualitative plot: EU Debates at K*={k_star}")
+    print(f"\nQualitative plot: EU Debates{tag} at K*={k_star}")
     plot_qualitative(eu_docs, k_star, SEEDS[0], eu_cache, eu_embs,
-                     corpus_name="EU Debates", min_df=10)
+                     corpus_name=f"EU Debates{tag}", min_df=10)
 
     print(f"\nAll outputs saved to {OUT_DIR}/")
     print("Done.")
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="SCPTM paper benchmark — run models across 4 corpora."
+    )
+    parser.add_argument(
+        "--chunk-chars", type=int, default=None,
+        help="Split every document into <=N-char segments before any model "
+             "runs (applied uniformly to LDA/CTM/BERTopic/SCPTM). Omit for "
+             "the baseline (whole documents, unchanged). Writes to a "
+             "separate results_chunk{N}/ directory — never overwrites the "
+             "baseline run. Launch once per chunk size you want to compare.",
+    )
+    args = parser.parse_args()
+    main(chunk_chars=args.chunk_chars)

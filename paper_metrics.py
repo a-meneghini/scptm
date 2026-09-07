@@ -483,27 +483,116 @@ def valence_density(strings: List[str]) -> float:
     return float(np.mean(vals)) if vals else float("nan")
 
 
-def mwe_vs_unigram_valence(mwe_per_topic, single_per_topic) -> dict:
-    """
-    Compare evaluative loading of MWE phrases vs single-word keywords.
+# Lazy global so the (heavy) transformer sentiment classifier is loaded at
+# most once per process — mirrors _get_stance_pipe below.
+_SENTIMENT_PIPE = None
+_SENTIMENT_FAILED = False
+DEFAULT_SENTIMENT_MODEL = "siebert/sentiment-roberta-large-english"
 
-    Returns {mwe_valence, unigram_valence, valence_gap} where valence_gap =
-    mwe_valence - unigram_valence. A positive gap is the RQ3 signal: phrases
-    carry stance/frame that single words don't.
+
+def _get_sentiment_pipe(model_name: str):
+    global _SENTIMENT_PIPE, _SENTIMENT_FAILED
+    if _SENTIMENT_FAILED:
+        return None
+    if _SENTIMENT_PIPE is None:
+        try:
+            from transformers import pipeline
+            _SENTIMENT_PIPE = pipeline(
+                "text-classification", model=model_name,
+                truncation=True, max_length=64, top_k=None,
+            )
+        except Exception as e:                       # pragma: no cover
+            print(f"  [sentiment] transformer classifier unavailable ({e}); "
+                  f"valence_gap_tf will be NaN.")
+            _SENTIMENT_FAILED = True
+            return None
+    return _SENTIMENT_PIPE
+
+
+def transformer_valence_density(
+    strings: List[str],
+    model_name: str = DEFAULT_SENTIMENT_MODEL,
+    batch_size: int = 32,
+) -> float:
     """
-    out = {"mwe_valence": float("nan"),
-           "unigram_valence": float("nan"),
-           "valence_gap": float("nan")}
-    if not _HAS_VADER:
-        return out
+    Neural cross-check for valence_density (VADER): mean transformer-predicted
+    sentiment intensity over a list of strings. Same direction as VADER
+    (HIGHER = more evaluative/stance-laden), independent method — used to
+    confirm the valence gap isn't a VADER-specific artifact.
+
+    Handles two label schemas transparently:
+      - 3-class (label set includes "neutral", e.g. cardiffnlp/twitter-roberta):
+        intensity = 1 - P(neutral) — direct non-neutral probability mass.
+      - binary (POSITIVE/NEGATIVE only, e.g. siebert/sentiment-roberta-large):
+        no neutral class exists to reference — the model is always forced to
+        pick a pole, even for flat/descriptive text — so intensity is instead
+        the polarization abs(P(positive) - P(negative)): how far the
+        prediction sits from a 50/50 toss-up, used as an intensity proxy.
+        This is a real, weaker signal than a genuine neutral class would give
+        (a confidently-binary classifier can still be confident on bland
+        text), not a drop-in equivalent — noted here rather than silently
+        assumed equivalent to the 3-class case.
+
+    Returns NaN if transformers / the model is unavailable.
+    """
+    if not strings:
+        return float("nan")
+    pipe = _get_sentiment_pipe(model_name)
+    if pipe is None:
+        return float("nan")
+    texts = [s.replace("_", " ") for s in strings]
+    try:
+        preds = pipe(texts, batch_size=batch_size)
+    except Exception:
+        return float("nan")
+    vals = []
+    for p in preds:
+        scores = {d["label"].lower(): d["score"] for d in p}
+        if "neutral" in scores:
+            vals.append(1.0 - scores["neutral"])
+        else:
+            vals.append(abs(scores.get("positive", 0.0) - scores.get("negative", 0.0)))
+    return float(np.mean(vals)) if vals else float("nan")
+
+
+def mwe_vs_unigram_valence(
+    mwe_per_topic,
+    single_per_topic,
+    sentiment_model: str = DEFAULT_SENTIMENT_MODEL,
+) -> dict:
+    """
+    Compare evaluative loading of MWE phrases vs single-word keywords, scored
+    by two independent methods with different calibration biases — VADER
+    (lexicon, social-media-tuned) and a transformer classifier (default:
+    siebert/sentiment-roberta-large-english, trained across mixed review/
+    general-domain English, not social-media text) — so the RQ3 signal isn't
+    an artifact of either scorer's own domain fit.
+
+    Returns valence_gap (VADER) and valence_gap_tf (transformer); a positive
+    gap under BOTH is the corroborated RQ3 signal: phrases carry stance/frame
+    that single words don't.
+    """
+    out = {
+        "mwe_valence": float("nan"), "unigram_valence": float("nan"),
+        "valence_gap": float("nan"),
+        "mwe_valence_tf": float("nan"), "unigram_valence_tf": float("nan"),
+        "valence_gap_tf": float("nan"),
+    }
     mwe_flat = [p for t in (mwe_per_topic or []) for p in t]
     uni_flat = [w for t in (single_per_topic or []) for w in t]
-    mv = valence_density(mwe_flat)
-    uv = valence_density(uni_flat)
-    out["mwe_valence"] = mv
-    out["unigram_valence"] = uv
-    if not math.isnan(mv) and not math.isnan(uv):
-        out["valence_gap"] = mv - uv
+
+    if _HAS_VADER:
+        mv, uv = valence_density(mwe_flat), valence_density(uni_flat)
+        out["mwe_valence"], out["unigram_valence"] = mv, uv
+        if not math.isnan(mv) and not math.isnan(uv):
+            out["valence_gap"] = mv - uv
+
+    mv_tf = transformer_valence_density(mwe_flat, sentiment_model)
+    uv_tf = transformer_valence_density(uni_flat, sentiment_model)
+    out["mwe_valence_tf"], out["unigram_valence_tf"] = mv_tf, uv_tf
+    if not math.isnan(mv_tf) and not math.isnan(uv_tf):
+        out["valence_gap_tf"] = mv_tf - uv_tf
+
     return out
 
 

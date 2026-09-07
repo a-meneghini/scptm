@@ -168,6 +168,29 @@ class SCPTMConfig:
     use_mixed_precision: bool = True
     use_neighbor_sampling: bool = False
 
+    # ---- Auto neighbor-sampling safety net ----
+    # doc-word ("contains") and its mirror ("rev_contains") are NOT covered
+    # by pmi_sparse_graph (that only sparsifies word-word "relates" edges),
+    # so their combined count grows unchecked with corpus size x doc length.
+    # When effective_edges = 2*n_dw + n_ww exceeds this threshold and
+    # use_neighbor_sampling is still False, model.fit() auto-enables it and
+    # warns — this is the same fix applied ad hoc for the UN Debates OOM
+    # (10M+ edges, commit 753d9c0), now a library default instead of
+    # something to remember per-script.
+    #
+    # NOTE: neighbor sampling requires pyg-lib or torch-sparse, both of
+    # which ship prebuilt .so files linked against a newer glibc than many
+    # servers have (needs glibc >=2.32; e.g. Debian 11's 2.31 is too old,
+    # confirmed on our benchmark host — an OS-level constraint, not fixable
+    # via pip). If neither package can be installed on your machine, either
+    # keep this threshold above what your corpora need (verified safe on an
+    # idle 48GB A40: EU Debates' ~3.4M effective edges in full-batch mode
+    # peaked under 3GB GPU memory) or set use_neighbor_sampling=True only
+    # after confirming pyg-lib/torch-sparse actually import — a graph that
+    # exceeds this threshold WILL try neighbor sampling and crash instead of
+    # OOMing if that import doesn't work.
+    neighbor_sampling_edge_threshold: int = 8_000_000
+
     # ---- Trainable word embeddings ----
     # When True, the decoder word embeddings start from SBERT but are updated
     # end-to-end via the reconstruction loss → β adapts to corpus co-occurrence,

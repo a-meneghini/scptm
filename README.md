@@ -1,6 +1,6 @@
 # SCPTM — Structural Contextual Probabilistic Topic Model
 
-A VAE-based topic model that combines heterogeneous graph neural networks over
+A topic model technique that combines heterogeneous graph neural networks over
 syntactic dependency graphs with contextual SBERT word embeddings.
 
 ---
@@ -17,16 +17,6 @@ Vocabulary ──SBERT──► word embeddings ┘                             
                      topic_embeddings ──cosine/T──► β (topic×vocab) ──θ·β──► recon loss
 ```
 
-**Key design choices:**
-
-| Component | What it does |
-|---|---|
-| **HeteroConv / GAT encoder** | Propagates information through doc→word, word→word (syntax) and word→doc edges to produce per-document latent representations |
-| **Contextual beta** | At evaluation: per-word topic affinity computed via attention pooling over SBERT sentence embeddings. At training: differentiable cosine similarity with temperature scaling |
-| **Beta temperature (T=0.1)** | Cosine similarities in R³⁸⁴ concentrate near 0 (std≈1/√384≈0.051). Dividing by T maps them to ≈[−10,+10], making the softmax discriminative and gradients non-zero |
-| **Word k-means init** | Topic embeddings are initialised from k-means centroids of the *word* embedding space (not documents), guaranteeing high cosine similarity with nearby vocabulary words from epoch 1 |
-| **VAE with KL annealing** | Linear/cyclical schedule + free bits (per-dimension KL floor) to prevent posterior collapse |
-| **Topic diversity loss** | Cosine repulsion between topic embedding pairs to prevent topic collapse |
 
 ---
 
@@ -72,7 +62,7 @@ documents = [
     "Machine learning is transforming healthcare diagnostics.",
     "Deep neural networks achieve state-of-the-art performance in NLP.",
     "Climate change accelerates biodiversity loss in tropical regions.",
-    # ... hundreds more
+    # ...  more
 ]
 
 # One-liner with defaults (10 topics, filtered syntax graph, English)
@@ -83,14 +73,14 @@ theta = model.fit_transform(documents)    # (n_docs, K) topic mixtures
 model.get_topic_info(top_k=10)
 
 # Out-of-sample inference
-new_theta = model.transform(["A new document about AI research."])
+new_theta = model.transform(["A new text about politics in development countries"])
 
 # Evaluation
 metrics = model.evaluate()
 print(metrics)
 # → {'npmi_coherence': 0.12, 'topic_diversity': 0.87, ...}
 
-# Persist and reload
+# Save and reload your model
 model.save("my_model.pkl")
 model2 = SCPTM.load("my_model.pkl")
 ```
@@ -99,7 +89,7 @@ model2 = SCPTM.load("my_model.pkl")
 
 ## Configuration
 
-All hyper-parameters live in `SCPTMConfig`. Passing keyword arguments to `SCPTM()` directly is a shorthand for `SCPTM(config=SCPTMConfig(...))`.
+All hyper-parameters are defined in `SCPTMConfig`. Passing keyword arguments to `SCPTM()` directly is a shorthand for `SCPTM(config=SCPTMConfig(...))`.
 
 ```python
 from scptm import SCPTM, SCPTMConfig
@@ -111,10 +101,10 @@ cfg = SCPTMConfig(
 
     # ── Graph ──────────────────────────────────────────────────────────────
     graph_mode          = "filtered",
-    # "none"      — no graph; pure MLP encoder (CTM-like baseline)
+    # "none"      — no graph
     # "no_syntax" — doc-word edges only, no word-word edges
     # "full_dep"  — all content dependency types
-    # "filtered"  — informative dependency types only (default, recommended)
+    # "filtered"  — dependencies that connect content words (nsubj, obj/dobj, amod, nmod, compound, conj, xcomp) only (default, recommended)
 
     # ── Training ───────────────────────────────────────────────────────────
     epochs              = 50,
@@ -160,8 +150,8 @@ model = SCPTM(config=cfg)
 
 ## Parse and embedding cache
 
-spaCy lemmatisation, dependency parsing, and contextual SBERT embeddings are the
-dominant cost on large corpora. Passing `edge_cache_path` persists all of them to a
+spaCy lemmatisation, dependency parsing, and contextual SBERT embeddings are
+highly impacting when working on large corpora. Passing `edge_cache_path` persists all of them to a
 single pickle file and skips re-computation on subsequent runs.
 
 ```python
@@ -183,7 +173,7 @@ changes, the stale cache is detected automatically and rebuilt.
 
 ```python
 # Set globally
-cfg = SCPTMConfig(keyword_method="ctfidf")
+cfg = SCPTMConfig(keyword_method="cosine")
 
 # Or override per call
 model.get_topic_info(top_k=10, method="cosine")
@@ -194,91 +184,7 @@ model.get_topics_dict(top_k=5)          # returns single words + bigrams/trigram
 | Method | Ranks by | Best for |
 |--------|----------|----------|
 | `"cosine"` (default) | Cosine similarity between topic embedding and context-pooled word embedding | Semantically central terms |
-| `"ctfidf"` | Class-based TF-IDF (each topic treated as a document class) | Discriminative / distinctive terms |
-
----
-
-## Iterative refinement
-
-Alternates between standard training and blending document embeddings toward their
-dominant topic centroid. Useful when the initial embedding space lacks clear cluster structure.
-
-```python
-theta = model.fit(
-    documents,
-    iterative_refinement = True,
-    n_refinement_steps   = 3,     # train → refine → train → ... (N steps)
-    refinement_blend     = 0.2,   # alpha: 0 = no blend, 1 = full centroid
-).theta
-```
-
----
-
-## Uncertainty quantification (Monte Carlo)
-
-```python
-cfg = SCPTMConfig(n_mc_samples=20)
-model = SCPTM(config=cfg)
-model.fit(documents)
-
-# Per-document uncertainty regime
-df = model.get_uncertainty_report()
-# Columns: doc_id, regime, mean_std_mc, entropy_theta, dominant_topic, ...
-# Regimes: CERTAIN | MODERATE | AMBIGUOUS | POORLY_ENCODED
-```
-
----
-
-## Comparison with baselines
-
-To compare SCPTM against a CTM-like baseline and a TriTopic-like baseline:
-
-```python
-import pandas as pd
-from scptm import SCPTM, SCPTMConfig
-
-BASE = dict(num_topics=10, lang='eng', epochs=50, apply_chunking=False)
-
-# CTM-like (no graph, MLP encoder only)
-m_ctm = SCPTM(**BASE, graph_mode='none')
-m_ctm.fit_transform(docs)
-r_ctm = m_ctm.evaluate()
-
-# TriTopic-like (no graph + iterative embedding refinement)
-m_tri = SCPTM(**BASE, graph_mode='none')
-m_tri.fit(docs, iterative_refinement=True, n_refinement_steps=3, refinement_blend=0.2)
-r_tri = m_tri.evaluate()
-
-# SCPTM with filtered syntax graph
-m_full = SCPTM(**BASE, graph_mode='filtered')
-m_full.fit_transform(docs)
-r_full = m_full.evaluate()
-
-# SCPTM + refinement
-m_best = SCPTM(**BASE, graph_mode='filtered')
-m_best.fit(docs, iterative_refinement=True, n_refinement_steps=3, refinement_blend=0.2)
-r_best = m_best.evaluate()
-
-rows = [
-    ("CTM (no graph)",                r_ctm),
-    ("TriTopic-like (no graph+refine)", r_tri),
-    ("SCPTM (GNN filtered)",          r_full),
-    ("SCPTM + refine",                r_best),
-]
-df = pd.DataFrame([
-    {"model": name,
-     "npmi": round(r.get("npmi_coherence", float("nan")), 3),
-     "diversity": round(r.get("topic_diversity", float("nan")), 3)}
-    for name, r in rows
-])
-print(df.to_string(index=False))
-```
-
-For a full sweep across all four graph modes:
-
-```python
-results = SCPTM.run_ablation_study(documents, epochs=50)
-```
+| `"ctfidf"` | Class-based TF-IDF (each topic treated as a document class) similar to BERTopic | Useful to retrieve discriminative terms |
 
 ---
 
@@ -292,37 +198,12 @@ model.visualize_2d()      # high-res PNG for papers (300 dpi)
 
 ---
 
-## Architecture comparison
-
-| | LDA | BERTopic | CTM | TriTopic | **SCPTM** |
-|--|--|--|--|--|--|
-| Model type | Generative (BoW) | Clustering | VAE | Clustering + refinement | VAE-GNN |
-| Input signal | Co-occurrence | Embeddings | SBERT | SBERT | SBERT + syntax |
-| Syntactic graph | ✗ | ✗ | ✗ | ✗ | ✓ |
-| Contextual word embeddings | ✗ | ✗ | ✓ | ✓ | ✓ |
-| Out-of-sample inference | ✓ | ✓ | ✓ | ✓ | ✓ |
-| MC uncertainty | ✗ | ✗ | ✗ | ✗ | ✓ |
-| Iterative refinement | ✗ | ✗ | ✗ | ✓ | ✓ (optional) |
-| Multilingual | ✗ | ✓ | ✓ | partial | ✓ (eng/ita) |
-| Embedding cache | ✗ | ✗ | ✗ | ✗ | ✓ |
-
-> **When does the syntax graph help?**
-> On formal corpora (scientific papers, news, legal documents) syntactic
-> dependencies carry strong discriminative signal. On short informal text
-> (social media, chat) the gap over a CTM baseline is smaller; use
-> `graph_mode="none"` as a fast sanity-check.
-
----
-
-## Notes on metrics
+## Metrics
 
 **NPMI coherence** measures how often a topic's top words co-occur in documents.
-Typical target: > 0.10. Scores < 0 are common on short informal text (Reddit,
-chat, social media) where words appear in isolation rather than in recurring
-co-occurrence patterns — this is a property of the corpus, not a model failure.
 
 **Topic diversity** = fraction of unique words across all topic top-word lists.
-Score in [0, 1]; > 0.70 is generally considered good.
+Score in [0, 1]
 
 ---
 

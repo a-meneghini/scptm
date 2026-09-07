@@ -15,7 +15,7 @@ with open("README.md", encoding="utf-8") as f:
 
 setup(
     name="scptm",
-    version="0.2.0",
+    version="0.2.1",
     author="Alessandro Meneghini",
     author_email="alessandro.meneghini@uniud.it",
     description=(

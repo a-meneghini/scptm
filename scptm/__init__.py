@@ -25,6 +25,7 @@ License: MIT
 from .model import SCPTM
 from .config import SCPTMConfig
 from .evaluation import SCPTMEvaluator
+from .selection import search_k
 
-__version__ = "0.2.0"
-__all__ = ["SCPTM", "SCPTMConfig", "SCPTMEvaluator"]
+__version__ = "0.2.1"
+__all__ = ["SCPTM", "SCPTMConfig", "SCPTMEvaluator", "search_k"]

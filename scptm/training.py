@@ -155,9 +155,16 @@ def _compute_loss(
     device: torch.device,
     static_word_embs: torch.Tensor,
     ppmi_tensor: Optional[torch.Tensor] = None,
+    prior_mu_b: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute ELBO loss for a mini-batch, plus optional coherence terms.
+
+    Parameters
+    ----------
+    prior_mu_b : Tensor, shape (B, K) or None
+        Covariate-informed prior mean for this batch.
+        When None, uses the standard N(0, I) prior.
 
     Returns
     -------
@@ -181,7 +188,14 @@ def _compute_loss(
     recon_loss = -torch.sum(bow_target * torch.log(recon_probs + 1e-10)) / B
 
     # ---- KL divergence with free bits ----
-    kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())   # (B, K)
+    # When a covariate prior is given, shift the N(0,I) prior to N(Γx, I):
+    #   KL = -0.5 * sum(1 + logvar - (mu - prior_mu)^2 - exp(logvar))
+    if prior_mu_b is not None:
+        kl_per_dim = -0.5 * (
+            1 + logvar - (mu - prior_mu_b).pow(2) - logvar.exp()
+        )
+    else:
+        kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
     if cfg.free_bits > 0.0:
         kl_per_dim = torch.clamp(kl_per_dim, min=cfg.free_bits)
     kl_loss = kl_per_dim.sum() / B
@@ -214,6 +228,7 @@ def train(
     cfg: SCPTMConfig,
     device: torch.device,
     vocab: Optional[List[str]] = None,
+    covariate_tensor: Optional[torch.Tensor] = None,
 ) -> dict:
     """
     Train SCPTM and return a history dict with per-epoch metrics.
@@ -236,6 +251,9 @@ def train(
         Vocabulary for NPMI coherence logging.  When None the metric is
         skipped (avoids the index-vs-string mismatch that previously always
         returned 0.0).
+    covariate_tensor : Tensor, shape (n_segments, n_covariates) or None
+        Per-segment covariate values (already on CPU; moved to device inside).
+        When provided, conditions the KL prior à la STM: KL(q || N(Γx, I)).
 
     Returns
     -------
@@ -305,6 +323,9 @@ def train(
         if epoch % cfg.beta_refresh_epochs == 0:
             model.compute_contextual_beta(ctx_embs_list, static_word_embs)
 
+        # Move covariate to device once per epoch (cheap if already there)
+        cov_dev = covariate_tensor.to(device) if covariate_tensor is not None else None
+
         if loader is not None:
             # ------ Neighbour-sampling path ------
             for batch in loader:
@@ -314,9 +335,13 @@ def train(
                 with torch.amp.autocast("cuda", enabled=(scaler is not None)):
                     mu, logvar = model.encode(batch.x_dict, batch.edge_index_dict)
                     doc_indices = batch["doc"].n_id
+                    prior_mu_b = (
+                        model.compute_prior_mean(cov_dev[doc_indices.cpu()])
+                        if cov_dev is not None else None
+                    )
                     recon_loss, kl_loss, we_loss, npmi_loss = _compute_loss(
                         model, mu, logvar, doc_indices, bow_csr, cfg, device,
-                        static_word_embs, ppmi_tensor,
+                        static_word_embs, ppmi_tensor, prior_mu_b=prior_mu_b,
                     )
                     div_loss = model.topic_diversity_loss()
                     loss = (
@@ -352,9 +377,16 @@ def train(
                     )
                     mu_b     = mu[batch_indices]
                     logvar_b = logvar[batch_indices]
+                    # Compute prior_mu fresh per batch so each backward() has its
+                    # own graph — computing it once outside the loop and indexing
+                    # would free the graph after the first batch.
+                    prior_mu_b = (
+                        model.compute_prior_mean(cov_dev[batch_indices])
+                        if cov_dev is not None else None
+                    )
                     recon_loss, kl_loss, we_loss, npmi_loss = _compute_loss(
                         model, mu_b, logvar_b, batch_indices, bow_csr, cfg, device,
-                        static_word_embs, ppmi_tensor,
+                        static_word_embs, ppmi_tensor, prior_mu_b=prior_mu_b,
                     )
                     div_loss = model.topic_diversity_loss()
                     loss = (

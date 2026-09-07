@@ -48,6 +48,7 @@ run_ablation_study(documents, epochs, **kwargs) → DataFrame
 """
 
 import pickle
+import warnings
 from pathlib import Path
 from typing import List, Optional, Union
 
@@ -66,7 +67,7 @@ from .graph import (
     prepare_corpus,
     save_ctx_embs_to_cache,
 )
-from .keywords import extract_separated_topics, extract_top_words
+from .keywords import extract_rake_keywords, extract_separated_topics, extract_top_words
 from .nlp import setup_nlp_pipeline
 from .nn import VariationalGraphTopicModel
 from .training import train
@@ -120,6 +121,10 @@ class SCPTM:
         self._history: Optional[dict] = None
         self._device: Optional[torch.device] = None
         self._topics_dict: Optional[dict] = None
+        # Covariate support
+        self._covariate_tensor: Optional[torch.Tensor] = None
+        self._doc_indices: Optional[List[int]] = None
+        self._covariate_labels: Optional[np.ndarray] = None
 
     # ------------------------------------------------------------------
     # scikit-learn compatible API
@@ -134,6 +139,7 @@ class SCPTM:
         n_refinement_steps: int = 2,
         refinement_blend: float = 0.2,
         edge_cache_path: Optional[str] = None,
+        covariate=None,
     ) -> "SCPTM":
         """
         Fit SCPTM on a corpus.
@@ -154,6 +160,11 @@ class SCPTM:
             Path to a parse cache file. If the file exists the spaCy parsing
             steps are skipped on load. If it doesn't exist, it is created
             after the first parse so subsequent runs are fast.
+        covariate : array-like of shape (n_docs,) or None
+            Per-document covariate for STM-style prevalence conditioning.
+            Numeric values are z-standardised; string/categorical values are
+            one-hot encoded.  Must have one entry per *raw* document (before
+            chunking), not per segment.
 
         Returns
         -------
@@ -161,26 +172,71 @@ class SCPTM:
         """
         cfg = self.config
 
+        # ---- 0. Seed torch's global RNG ----
+        # random_state was previously only forwarded to sklearn (k-means init)
+        # and UMAP — PyTorch's own RNG was never seeded, so GATConv/Linear
+        # weight init, training.py's torch.randperm() batch shuffling, and
+        # the VAE reparameterization noise (torch.randn_like) all drew from
+        # whatever global RNG state happened to exist at call time. Two
+        # fit() calls with the same random_state produced different theta
+        # (verified: max abs diff ~0.06 on a toy corpus) despite the
+        # parameter's name and docstring implying reproducibility.
+        torch.manual_seed(cfg.random_state)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(cfg.random_state)
+
         # ---- 1. NLP pipeline ----
         self._sbert, self._nlp, self._stop = setup_nlp_pipeline(cfg.lang)
 
-        # ---- 2. Corpus ----
-        self._corpus = prepare_corpus(
+        # ---- 2. Corpus (with doc_indices for covariate alignment) ----
+        self._corpus, self._doc_indices = prepare_corpus(
             source,
             source_type=source_type,
             text_col=text_col,
             apply_chunking=cfg.apply_chunking,
             max_chunk_chars=cfg.max_chunk_chars,
+            return_doc_indices=True,
         )
 
         # ---- 3. Graph ----
-        self._graph_data, self._vocab, self._bow_sparse, n_dw, n_ww = build_hetero_graph(
+        (
+            self._graph_data, self._vocab, self._bow_sparse, n_dw, n_ww,
+            self._dep_triples,
+        ) = build_hetero_graph(
             self._corpus, self._sbert, self._nlp, self._stop, cfg,
             edge_cache_path=edge_cache_path,
         )
         self._vocab_idx = {w: i for i, w in enumerate(self._vocab)}
         emb_dim = self._graph_data["doc"].x.shape[1]
         estimate_graph_memory(len(self._corpus), len(self._vocab), n_dw, n_ww, emb_dim)
+
+        # ---- 3b. Auto-enable neighbor sampling on large graphs ----
+        # 2*n_dw accounts for "contains" + its "rev_contains" mirror (both
+        # process n_dw edges through their own GATConv); neither is capped
+        # by pmi_sparse_graph, which only sparsifies "relates" (n_ww).
+        effective_edges = 2 * n_dw + n_ww
+        if (
+            cfg.graph_mode != "none"
+            and not cfg.use_neighbor_sampling
+            and effective_edges > cfg.neighbor_sampling_edge_threshold
+        ):
+            warnings.warn(
+                f"[SCPTM] Graph has {effective_edges:,} effective edges "
+                f"(doc-word counted twice for the contains/rev_contains "
+                f"pair, plus word-word), above the "
+                f"neighbor_sampling_edge_threshold "
+                f"({cfg.neighbor_sampling_edge_threshold:,}). "
+                f"Auto-enabling use_neighbor_sampling=True to avoid "
+                f"materialising the full adjacency on GPU at once — this "
+                f"is the same fix previously needed ad hoc for large "
+                f"corpora (UN Debates, 10M+ edges) to prevent OOM. "
+                f"Set use_neighbor_sampling=True explicitly to silence "
+                f"this warning, or raise "
+                f"neighbor_sampling_edge_threshold in SCPTMConfig if you "
+                f"have GPU memory to spare and want the full-batch GNN.",
+                stacklevel=2,
+            )
+            cfg.use_neighbor_sampling = True
 
         # ---- 4. Device ----
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -205,13 +261,27 @@ class SCPTM:
             if edge_cache_path is not None:
                 save_ctx_embs_to_cache(edge_cache_path, self._ctx_embs_list)
 
+        # ---- 5b. Covariate encoding ----
+        self._covariate_tensor = None
+        self._covariate_labels = None
+        if covariate is not None:
+            self._covariate_tensor, self._covariate_labels = self._encode_covariate(
+                covariate, self._doc_indices
+            )
+            print(
+                f"  Covariate: {self._covariate_tensor.shape[1]} dimension(s), "
+                f"{self._covariate_tensor.shape[0]} segments"
+            )
+
         # ---- 6. Model ----
+        n_cov = self._covariate_tensor.shape[1] if self._covariate_tensor is not None else 0
         self._nn = VariationalGraphTopicModel(
             emb_dim, cfg.hidden_channels, cfg.num_topics,
             len(self._vocab), graph_mode=cfg.graph_mode,
             beta_temperature=cfg.beta_temperature,
             trainable_word_embeddings=cfg.trainable_word_embeddings,
             encoder_residual=cfg.encoder_residual,
+            n_covariates=n_cov,
         ).to(self._device)
 
         # ---- 6b. K-means initialisation of topic embeddings ----
@@ -271,6 +341,7 @@ class SCPTM:
                 self._ctx_embs_list, self._static_word_embs,
                 cfg, self._device,
                 vocab=self._vocab,
+                covariate_tensor=self._covariate_tensor,
             )
 
         # ---- 8. Final inference ----
@@ -339,14 +410,56 @@ class SCPTM:
         source_type: str = "list",
         text_col: Optional[str] = None,
         edge_cache_path: Optional[str] = None,
+        covariate=None,
         **fit_kwargs,
     ) -> torch.Tensor:
         """Fit and return topic mixtures for training documents."""
         self.fit(
             source, source_type=source_type, text_col=text_col,
-            edge_cache_path=edge_cache_path, **fit_kwargs,
+            edge_cache_path=edge_cache_path,
+            covariate=covariate,
+            **fit_kwargs,
         )
         return self._theta
+
+    # ------------------------------------------------------------------
+    # Covariate encoding
+    # ------------------------------------------------------------------
+
+    def _encode_covariate(self, covariate, doc_indices: List[int]):
+        """
+        Encode a per-document covariate and align it to segments.
+
+        Categorical (str/object) → one-hot (sklearn LabelEncoder + OneHotEncoder).
+        Numeric → z-standardised, shape (N_segments, 1).
+
+        Returns
+        -------
+        cov_tensor : torch.Tensor, shape (N_segments, n_cov)
+        labels : np.ndarray | None  — category labels for categorical covariates
+        """
+        from sklearn.preprocessing import LabelEncoder, OneHotEncoder
+
+        cov = np.array(covariate)
+        if len(cov) == 0:
+            raise ValueError("covariate is empty.")
+
+        if cov.dtype.kind in ("U", "S", "O"):       # categorical
+            le = LabelEncoder()
+            encoded = le.fit_transform(cov).reshape(-1, 1)
+            ohe = OneHotEncoder(sparse_output=False)
+            cov_matrix = ohe.fit_transform(encoded).astype(np.float32)
+            labels = le.classes_
+            print(f"  Covariate: categorical, {len(labels)} levels → {labels.tolist()}")
+        else:                                         # numeric
+            cov_f = cov.astype(np.float32)
+            cov_f = (cov_f - cov_f.mean()) / (cov_f.std() + 1e-10)
+            cov_matrix = cov_f.reshape(-1, 1)
+            labels = None
+
+        # Align per-document covariate to per-segment
+        seg_cov = cov_matrix[doc_indices]             # (N_segments, n_cov)
+        return torch.tensor(seg_cov, dtype=torch.float32), labels
 
     # ------------------------------------------------------------------
     # Iterative refinement
@@ -435,7 +548,7 @@ class SCPTM:
             if cfg.n_mc_samples > 1:
                 mc = []
                 for _ in range(cfg.n_mc_samples):
-                    z = self._nn.reparameterize(mu, logvar)
+                    z = self._nn.reparameterize(mu, logvar, sample=True)
                     mc.append(F.softmax(z, dim=-1).unsqueeze(0))
                 mc_stack = torch.cat(mc, dim=0)
                 theta_mean = mc_stack.mean(dim=0)
@@ -503,6 +616,7 @@ class SCPTM:
                 method=kw_method,
                 bow_sparse=self._bow_sparse if kw_method == "ctfidf" else None,
                 theta=self._theta if kw_method == "ctfidf" else None,
+                dep_triples=self._dep_triples,
             )
             self._topics_dict_key = cache_key
         return self._topics_dict
@@ -567,6 +681,7 @@ class SCPTM:
         td, mwe_embs, mwe_vocab = extract_separated_topics(
             self._corpus, self._nn, self._vocab,
             self._static_word_embs, self._sbert, self._stop,
+            dep_triples=self._dep_triples,
         )
         view_semantic_constellations_3d(
             self._nn, self._static_word_embs, self._vocab,
@@ -580,6 +695,7 @@ class SCPTM:
         td, mwe_embs, mwe_vocab = extract_separated_topics(
             self._corpus, self._nn, self._vocab,
             self._static_word_embs, self._sbert, self._stop,
+            dep_triples=self._dep_triples,
         )
         view_semantic_2d_paper(
             self._nn, self._static_word_embs, self._vocab,
@@ -596,23 +712,28 @@ class SCPTM:
         """Pickle the full model state to disk."""
         self._check_fitted()
         state = {
-            "config":           self.config,
-            "nn_state_dict":    self._nn.state_dict(),
-            "vocab":            self._vocab,
-            "bow_sparse":       self._bow_sparse,
-            "corpus":           self._corpus,
-            "theta":            self._theta,
-            "theta_uncertainty":self._theta_uncertainty,
-            "history":          self._history,
-            "cached_beta":      self._nn._cached_beta,
-            "static_word_embs": self._static_word_embs.cpu(),
-            "ctx_embs_list":    self._ctx_embs_list,
-            "graph_doc_x":      self._graph_data["doc"].x.cpu(),
-            "graph_word_x":     self._graph_data["word"].x.cpu(),
-            # Edge indices — persisted so loaded models can run full GNN inference
+            "config":             self.config,
+            "nn_state_dict":      self._nn.state_dict(),
+            "vocab":              self._vocab,
+            "bow_sparse":         self._bow_sparse,
+            "corpus":             self._corpus,
+            "dep_triples":        self._dep_triples,
+            "theta":              self._theta,
+            "theta_uncertainty":  self._theta_uncertainty,
+            "history":            self._history,
+            "cached_beta":        self._nn._cached_beta,
+            "static_word_embs":   self._static_word_embs.cpu(),
+            "ctx_embs_list":      self._ctx_embs_list,
+            "graph_doc_x":        self._graph_data["doc"].x.cpu(),
+            "graph_word_x":       self._graph_data["word"].x.cpu(),
             "edge_dw":  self._graph_data["doc", "contains", "word"].edge_index.cpu(),
             "edge_wd":  self._graph_data["word", "rev_contains", "doc"].edge_index.cpu(),
             "edge_ww":  self._graph_data["word", "relates", "word"].edge_index.cpu(),
+            # Covariate state
+            "covariate_tensor":   self._covariate_tensor,
+            "doc_indices":        self._doc_indices,
+            "covariate_labels":   self._covariate_labels,
+            "n_covariates":       self._nn.n_covariates,
         }
         with open(path, "wb") as f:
             pickle.dump(state, f)
@@ -632,12 +753,18 @@ class SCPTM:
         model._vocab_idx  = {w: i for i, w in enumerate(state["vocab"])}
         model._bow_sparse = state["bow_sparse"]
         model._corpus     = state["corpus"]
+        model._dep_triples = state.get("dep_triples", {})
         model._theta      = state["theta"]
         model._theta_uncertainty = state["theta_uncertainty"]
         model._history    = state["history"]
 
         model._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         emb_dim       = state["graph_doc_x"].shape[1]
+
+        model._covariate_tensor = state.get("covariate_tensor")
+        model._doc_indices      = state.get("doc_indices")
+        model._covariate_labels = state.get("covariate_labels")
+        n_cov = state.get("n_covariates", 0)
 
         model._nn = VariationalGraphTopicModel(
             emb_dim,
@@ -646,6 +773,11 @@ class SCPTM:
             len(state["vocab"]),
             graph_mode=state["config"].graph_mode,
             beta_temperature=getattr(state["config"], "beta_temperature", 0.1),
+            encoder_residual=getattr(state["config"], "encoder_residual", True),
+            trainable_word_embeddings=getattr(
+                state["config"], "trainable_word_embeddings", True
+            ),
+            n_covariates=n_cov,
         ).to(model._device)
         model._nn.load_state_dict(state["nn_state_dict"])
         model._nn._cached_beta = (
@@ -672,6 +804,195 @@ class SCPTM:
         model._is_fitted = True
         print(f"Model loaded from {path}")
         return model
+
+    # ------------------------------------------------------------------
+    # Topic selection
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def search_k(
+        cls,
+        docs: List[str],
+        k_grid=(5, 10, 15, 20, 25, 30),
+        edge_cache_path: Optional[str] = None,
+        epochs: int = 50,
+        finetune: bool = True,
+        verbose: bool = True,
+        **kwargs,
+    ):
+        """
+        Grid search for the optimal number of topics K.
+
+        Fits SCPTM for each K in k_grid, scores by NPMI × Diversity,
+        optionally fine-tunes around the best grid point.
+
+        The edge cache is built once and reused across all K values.
+
+        Parameters
+        ----------
+        docs : list of str
+        k_grid : sequence of int, default (5, 10, 15, 20, 25, 30)
+        edge_cache_path : str | None
+            Strongly recommended: avoids re-parsing for every K.
+        epochs : int
+        finetune : bool
+            If True, adds a finer search around the best grid K.
+        verbose : bool
+        **kwargs
+            Forwarded to SCPTMConfig (lang, graph_mode, …).
+
+        Returns
+        -------
+        best_k : int
+        best_model : SCPTM
+        results : dict  {K: {"model", "npmi", "div", "score"}}
+        """
+        from .selection import search_k as _search_k
+
+        return _search_k(
+            docs=docs,
+            k_grid=k_grid,
+            edge_cache_path=edge_cache_path,
+            epochs=epochs,
+            finetune=finetune,
+            verbose=verbose,
+            **kwargs,
+        )
+
+    # ------------------------------------------------------------------
+    # Covariate effect estimation
+    # ------------------------------------------------------------------
+
+    def estimate_effect(
+        self,
+        covariate,
+        covariate_name: str = "covariate",
+        topic_labels: Optional[List[str]] = None,
+        plot: bool = True,
+        save_path: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """
+        STM-style covariate effect estimation on topic prevalence.
+
+        For each topic k, regresses theta_k on the covariate using OLS.
+        The covariate is z-standardised internally.
+        Returns a DataFrame sorted by effect size; optionally plots
+        a coefficient plot with 95% CIs (p<0.05 highlighted in red).
+
+        Parameters
+        ----------
+        covariate : array-like, length = n_segments
+            Must be aligned to model._corpus (one value per segment).
+        covariate_name : str
+            Label for the x-axis.
+        topic_labels : list of str | None
+            Custom topic labels. Defaults to top-2 keywords per topic.
+        plot : bool
+            If True, shows the coefficient plot.
+        save_path : str | None
+            If provided, saves the plot here.
+
+        Returns
+        -------
+        pd.DataFrame with columns: topic, coef, se, p, r2
+        """
+        import matplotlib.patches as mpatches
+        import matplotlib.pyplot as plt
+        from scipy import stats
+
+        self._check_fitted()
+        theta = self._theta.numpy()               # (N, K)
+        x = np.array(covariate, dtype=float)
+        if len(x) != theta.shape[0]:
+            raise ValueError(
+                f"covariate length {len(x)} != n_segments {theta.shape[0]}. "
+                "Align covariate to model._corpus."
+            )
+        x = (x - x.mean()) / (x.std() + 1e-10)  # z-standardise
+
+        if topic_labels is None:
+            td = self.get_topics_dict(top_k=3)
+            topic_labels = []
+            for k in range(self.config.num_topics):
+                entry = td.get(f"Topic_{k+1}", {})
+                kws = (entry.get("single", [])[:2] + entry.get("phrases", [])[:1])[:2]
+                topic_labels.append(" / ".join(kws) or f"T{k+1}")
+
+        K = self.config.num_topics
+        rows = []
+        for k in range(K):
+            slope, _intercept, r, p, se = stats.linregress(x, theta[:, k])
+            rows.append({
+                "topic": topic_labels[k],
+                "coef":  slope,
+                "se":    se,
+                "p":     p,
+                "r2":    r ** 2,
+            })
+        df = pd.DataFrame(rows).sort_values("coef").reset_index(drop=True)
+
+        if plot:
+            fig, ax = plt.subplots(figsize=(7, max(4, K * 0.4 + 1)))
+            for _, row in df.iterrows():
+                color = "#E53935" if row["p"] < 0.05 else "#757575"
+                ax.barh(
+                    row["topic"], row["coef"],
+                    xerr=row["se"] * 1.96,
+                    color=color, alpha=0.75,
+                    capsize=3, error_kw={"linewidth": 1},
+                )
+            ax.axvline(0, color="black", linewidth=0.8, linestyle="--")
+            ax.set_xlabel(f"Effect of {covariate_name} on topic prevalence (β ± 95% CI)")
+            ax.set_title("Covariate effect on topics")
+            sig_patch = mpatches.Patch(color="#E53935", alpha=0.75, label="p < 0.05")
+            ns_patch  = mpatches.Patch(color="#757575", alpha=0.75, label="n.s.")
+            ax.legend(handles=[sig_patch, ns_patch], fontsize=8)
+            plt.tight_layout()
+            if save_path:
+                fig.savefig(save_path, dpi=150, bbox_inches="tight")
+                print(f"Effect plot saved to {save_path}")
+            plt.show()
+
+        return df
+
+    # ------------------------------------------------------------------
+    # RAKE keyphrases
+    # ------------------------------------------------------------------
+
+    def get_rake_keywords(
+        self,
+        top_n_docs: int = 30,
+        top_k: int = 10,
+    ) -> dict:
+        """
+        RAKE keyphrase extraction from top-ranked segments per topic.
+
+        For each topic k, collects the top_n_docs segments by theta_k
+        score, concatenates them, and runs RAKE to extract keyphrases.
+        This is corpus-driven and complements the cosine-similarity-based
+        MWEs returned by get_topics_dict().
+
+        Requires: pip install rake-nltk
+
+        Parameters
+        ----------
+        top_n_docs : int
+            Segments to aggregate per topic.
+        top_k : int
+            Keyphrases to return per topic.
+
+        Returns
+        -------
+        dict : {"Topic_k": [keyphrase1, ...]}
+        """
+        self._check_fitted()
+        return extract_rake_keywords(
+            corpus=self._corpus,
+            theta=self._theta,
+            stop_words=self._stop,
+            top_n_docs=top_n_docs,
+            top_k=top_k,
+        )
 
     # ------------------------------------------------------------------
     # Ablation study

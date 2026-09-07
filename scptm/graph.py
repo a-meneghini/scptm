@@ -43,7 +43,7 @@ import pickle
 import warnings
 from collections import defaultdict
 from pathlib import Path
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -70,7 +70,8 @@ def prepare_corpus(
     text_col: Optional[str] = None,
     apply_chunking: bool = True,
     max_chunk_chars: int = 800,
-) -> List[str]:
+    return_doc_indices: bool = False,
+) -> Union[List[str], Tuple[List[str], List[int]]]:
     """
     Load and optionally chunk a text corpus.
 
@@ -86,11 +87,16 @@ def prepare_corpus(
         Split long documents into shorter segments.
     max_chunk_chars : int
         Maximum characters per chunk.
+    return_doc_indices : bool
+        If True, also return a list mapping each segment to its source
+        document index (useful for aligning per-document covariates).
 
     Returns
     -------
     List[str]
         Processed document strings.
+    (List[str], List[int])
+        Segments + doc_indices when return_doc_indices=True.
     """
     raw: List[str] = []
 
@@ -118,11 +124,17 @@ def prepare_corpus(
     print(f"Loaded {len(raw)} raw documents.")
 
     if not apply_chunking:
-        docs = [" ".join(t.split()) for t in raw if len(t.strip()) > 10]
-        return docs
+        docs: List[str] = []
+        doc_indices: List[int] = []
+        for doc_idx, t in enumerate(raw):
+            if len(t.strip()) > 10:
+                docs.append(" ".join(t.split()))
+                doc_indices.append(doc_idx)
+        return (docs, doc_indices) if return_doc_indices else docs
 
-    docs: List[str] = []
-    for text in raw:
+    docs = []
+    doc_indices = []
+    for doc_idx, text in enumerate(raw):
         clean = " ".join(text.split())
         sentences = clean.split(". ")
         chunk = ""
@@ -132,14 +144,16 @@ def prepare_corpus(
                 continue
             if len(chunk) + len(sent) > max_chunk_chars and chunk:
                 docs.append(chunk + ".")
+                doc_indices.append(doc_idx)
                 chunk = sent
             else:
                 chunk = chunk + ". " + sent if chunk else sent
         if len(chunk) > 50:
             docs.append(chunk + ".")
+            doc_indices.append(doc_idx)
 
     print(f"Final corpus: {len(docs)} segments.")
-    return docs
+    return (docs, doc_indices) if return_doc_indices else docs
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +223,7 @@ def _save_parse_cache(
     n_docs: int,
     doc_embs: Optional[np.ndarray] = None,
     word_embs_static: Optional[np.ndarray] = None,
+    dep_triples: Optional[dict] = None,
 ) -> None:
     """Persist the NLP-heavy outputs so they can be reused across runs.
 
@@ -228,6 +243,8 @@ def _save_parse_cache(
         cache["doc_embs"] = doc_embs
     if word_embs_static is not None:
         cache["word_embs_static"] = word_embs_static
+    if dep_triples is not None:
+        cache["dep_triples"] = dep_triples
     with open(path, "wb") as f:
         pickle.dump(cache, f)
     print(f"  [EdgeCache] Saved to '{path}'")
@@ -457,7 +474,7 @@ def build_hetero_graph(
     stop_words,
     cfg: SCPTMConfig,
     edge_cache_path: Optional[Union[str, Path]] = None,
-) -> Tuple[HeteroData, List[str], object, int, int]:
+) -> Tuple[HeteroData, List[str], object, int, int, Dict[Tuple[str, str, str], int]]:
     """
     Build a heterogeneous PyG graph over documents and vocabulary words.
 
@@ -468,11 +485,16 @@ def build_hetero_graph(
 
     Returns
     -------
-    data       : HeteroData
-    vocab_list : list of vocabulary strings
-    bow_sparse : CountVectorizer sparse BoW matrix (n_docs x vocab_size)
-    n_dw       : number of doc-word edges
-    n_ww       : number of word-word edges
+    data        : HeteroData
+    vocab_list  : list of vocabulary strings
+    bow_sparse  : CountVectorizer sparse BoW matrix (n_docs x vocab_size)
+    n_dw        : number of doc-word edges
+    n_ww        : number of word-word edges
+    dep_triples : {(head_lemma, dep_label, dependent_lemma): count} —
+        the same syntactic relations behind the word-word edges, kept with
+        their relation label (discarded from the edge tensor itself).
+        Empty for graph_mode in {"none", "no_syntax"}. Used by
+        keywords.extract_separated_topics for graph-based MWE extraction.
     """
     graph_mode = cfg.graph_mode
     assert graph_mode in GRAPH_MODES
@@ -502,6 +524,9 @@ def build_hetero_graph(
             doc_word_dst  = _cache["doc_word_dst"]
             word_word_src = _cache["word_word_src"]
             word_word_dst = _cache["word_word_dst"]
+            # dep_triples absent in caches written before this field existed —
+            # falls back to {} (MWE extraction then uses the n-gram fallback).
+            dep_triples   = _cache.get("dep_triples", {})
         print(f"  Vocabulary: {len(vocab)} unique lemmas (from cache).")
         _cache_was_used = True
     else:
@@ -570,13 +595,18 @@ def build_hetero_graph(
                 _dw_dst = _cache.get("doc_word_dst", []) if _cache else []
                 _ww_src = _cache.get("word_word_src", []) if _cache else []
                 _ww_dst = _cache.get("word_word_dst", []) if _cache else []
+                _dep_triples = _cache.get("dep_triples", {}) if _cache else {}
                 _save_parse_cache(
                     edge_cache_path, vocab_arr, bow_sparse,
                     _dw_src, _dw_dst, _ww_src, _ww_dst, len(documents),
                     doc_embs=doc_embs,
                     word_embs_static=word_embs_none,
+                    dep_triples=_dep_triples,
                 )
-        return data, vocab_arr.tolist(), bow_sparse, 0, 0
+        return (
+            data, vocab_arr.tolist(), bow_sparse, 0, 0,
+            _cache.get("dep_triples", {}) if _cache else {},
+        )
 
     # ---- Active dependency types ----
     if graph_mode == "filtered":
@@ -594,6 +624,12 @@ def build_hetero_graph(
         doc_word_src, doc_word_dst = [], []
         word_word_src, word_word_dst = [], []
         dep_counts = defaultdict(int)
+        # (head_lemma, dep_label, dependent_lemma) -> occurrence count.
+        # Same edges as word_word_src/dst, but keeping the relation label
+        # that would otherwise be discarded — used for graph-based MWE
+        # extraction (see keywords.extract_separated_topics) instead of
+        # surface n-grams.
+        dep_triple_counts: dict = defaultdict(int)
 
         for d_idx, text in enumerate(tqdm(documents, desc="Dependency parsing")):
             doc = nlp_model(text)
@@ -618,11 +654,14 @@ def build_hetero_graph(
                         word_word_src.append(w_idx)
                         word_word_dst.append(vocab[head_lemma])
                         dep_counts[token.dep_] += 1
+                        dep_triple_counts[(head_lemma, token.dep_, lemma)] += 1
 
         if dep_counts:
             print("  Syntactic edge distribution:")
             for dep, cnt in sorted(dep_counts.items(), key=lambda x: -x[1]):
                 print(f"    {dep:12s}: {cnt:6d}")
+
+        dep_triples = dict(dep_triple_counts)
 
     else:
         print("3/5  Syntactic parsing skipped (cache hit).")
@@ -652,6 +691,7 @@ def build_hetero_graph(
                 len(documents),
                 doc_embs=doc_embs,
                 word_embs_static=word_embs_static,
+                dep_triples=dep_triples,
             )
 
     # ---- 4b. PMI sparsification of word-word edges ----
@@ -668,9 +708,12 @@ def build_hetero_graph(
     print("5/5  Building edge tensors...")
     dw_idx = torch.tensor([doc_word_src, doc_word_dst], dtype=torch.long)
     data["doc", "contains", "word"].edge_index = dw_idx
-    # rev_contains removed from the encoder architecture; keep an empty tensor
-    # for backward compatibility with any cached HeteroData that expects the key.
-    data["word", "rev_contains", "doc"].edge_index = torch.empty((2, 0), dtype=torch.long)
+    # rev_contains is the reverse of contains (word -> doc), letting the
+    # encoder's gated word_to_doc_gate pull syntactic/graph context back
+    # into document representations.
+    data["word", "rev_contains", "doc"].edge_index = torch.tensor(
+        [doc_word_dst, doc_word_src], dtype=torch.long
+    )
 
     if word_word_src and graph_mode != "no_syntax":
         data["word", "relates", "word"].edge_index = torch.tensor(
@@ -685,4 +728,4 @@ def build_hetero_graph(
     n_ww = len(word_word_src)
     print(f"  Doc-word edges : {n_dw:,}")
     print(f"  Word-word edges: {n_ww:,}")
-    return data, vocab_arr.tolist(), bow_sparse, n_dw, n_ww
+    return data, vocab_arr.tolist(), bow_sparse, n_dw, n_ww, dep_triples
