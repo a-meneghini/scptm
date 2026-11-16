@@ -1,13 +1,18 @@
 # SCPTM
 
-**Topic models that read the grammar, not just the words.**
+Two Python packages for topic modelling with syntactic structure.
 
-Most topic models treat a document as a bag of words and throw the sentence
-structure away. SCPTM keeps it: lemmas are linked by the dependency edges of a
-parser, and those links shape the topics. The result is topics whose vocabulary
-follows how words actually combine — plus the multiword expressions
-(*"spirito santo"*, *"curia romano"*, *"payload orbit"*) that a bag of words can
-only ever see as two unrelated tokens.
+Both parse a corpus once with a dependency parser, link lemmas by the dependency
+relations found in it, and use those links inside the model. They are independent
+distributions: neither imports the other, and either can be installed alone.
+
+| package | import | model | 500 docs, K=6 |
+|---|---|---|---|
+| `scptm` | `scptm` | SBERT embeddings, heterogeneous graph, variational graph encoder | 70.2 s, NPMI 0.279 |
+| `scptm-bow` | `scptm_bow` | dependency-regularised NMF over a lemmatised bag of words, fastText vectors | 18.1 s, NPMI 0.334 |
+
+Timings and scores are from 20 Newsgroups (500 documents, vocabulary 1,377
+lemmas); the `scptm-bow` figure is with the default KL divergence.
 
 [![PyPI: scptm](https://img.shields.io/pypi/v/scptm.svg?label=scptm&color=4C72B0)](https://pypi.org/project/scptm/)
 [![PyPI: scptm-bow](https://img.shields.io/pypi/v/scptm-bow.svg?label=scptm-bow&color=DD8452)](https://pypi.org/project/scptm-bow/)
@@ -17,168 +22,101 @@ only ever see as two unrelated tokens.
 
 ![SCPTM architecture](paper/figures/scptm_architecture.png)
 
-*The neural pipeline (`scptm`). The count-based one (`scptm-bow`) keeps steps 1,
-2 and 4 — word vectors, dependency edges, MWE extraction — and replaces step 3
-with a regularised matrix factorisation.*
+*The `scptm` pipeline. `scptm-bow` uses steps 1, 2 and 4 — word vectors,
+dependency edges, MWE extraction — and replaces step 3 with a matrix
+factorisation.*
 
----
+## Installation
 
-## Two implementations, one question
+```bash
+pip install scptm            # requires torch and sentence-transformers
+pip install scptm-bow        # numpy, scipy, scikit-learn
+```
 
-The scientific question is whether syntax earns its parsing cost. SCPTM answers
-it twice, from opposite ends of the cost/accuracy spectrum, so a conclusion that
-holds in both is a property of the corpus rather than of the architecture.
+Extras for `scptm-bow`: `[udpipe]` (UDPipe lemmatiser instead of spaCy),
+`[vectors]` (fastText), `[plots]` (2D projection), `[full]`.
 
-| | **`scptm`** | **`scptm-bow`** |
-|---|---|---|
-| how it works | SBERT embeddings + heterogeneous dependency graph + variational graph encoder | dependency-regularised NMF over a lemmatised bag of words + fastText |
-| 500 docs, K=6 | 70.2 s | **18.1 s** |
-| NPMI | 0.279 | **0.334** |
-| reproducible to | local optima (neural) | **1.8 × 10⁻¹⁵** |
-| needs | GPU optional, SBERT download | CPU only, nothing to download |
-
-Neither depends on the other. Both expose the *same* metric API — `c_v`, `npmi`,
-`diversity`, `exclusivity`, `redundancy` — verified against a single frozen
-fixture, so a number from one package is comparable to the same number from the
-other.
-
-> On 20 Newsgroups the count-based model is 3.8× faster *and* more coherent than
-> the neural one. That is not the expected result, and it is why the ablation
-> apparatus below exists.
-
-## What you get
+## Usage
 
 ```python
 from scptm_bow import BowSCPTM
 
-model = BowSCPTM(num_topics=4, lang="eng")
-theta = model.fit_transform(documents)      # documents x topics
+model = BowSCPTM(num_topics=20, lang="ita", parser_backend="udpipe")
+model.fit(documents, cache_path="corpus.pkl")
+
+model.theta          # (n_docs, K)   document-topic
+model.topic_word     # (K, n_vocab)  topic-term
+model.top_words(10)  # list[list[str]]
+model.get_topic_info(10)   # list of dicts: topic_id, size, top_words, label, mwes
+model.get_mwes()           # multiword expressions per topic
+model.transform(new_documents)   # fold in, H fixed
 ```
 
-Real output from [`examples/demo.py`](packages/scptm-bow/examples/demo.py), 200
-documents and four hidden word pools:
+The neural package exposes the same entry points plus `plot_training()` and
+`visualize_3d()`.
 
-```
-vocabulary: 44 lemmas | dependency edges: 402 | syntax graph: 216 edges
-  c_v +0.956   npmi +0.972   diversity +1.000   exclusivity +1.000
-
-Topic 1  (n=50)
-  words: rocket, mission, launch, payload, astronaut, trajectory
-  MWEs : payload nasa, payload astronaut, payload orbit
-Topic 2  (n=50)
-  words: resolution, display, graphic, shader, polygon, texture
-  MWEs : resolution shader, pixel image, shader image
-```
-
-`theta` is the document–topic matrix, `model.topic_word` the topic–term matrix,
-`model.get_topic_info()` the table you would put in a paper, and
-`model.visualize_2d()` the semantic map below.
-
-![Semantic space](paper/figures/semantic_space_2d.png)
-
----
-
-## Install
+Both ship a command line interface:
 
 ```bash
-pip install scptm            # neural: needs torch + sentence-transformers
-pip install scptm-bow        # count-based: numpy, scipy, scikit-learn
-
-# extras
-pip install "scptm-bow[udpipe]"    # UDPipe lemmatiser instead of spaCy
-pip install "scptm-bow[plots]"     # 2D semantic-space figures
-pip install "scptm-bow[full]"      # everything
-```
-
-Both ship a command line front-end, so a corpus becomes a model in one line:
-
-```bash
-scptm-bow fit corpus.txt --topics 20 --lang ita --parser udpipe \
-    --out model.json --figure semantic_space_2d.png
+scptm-bow fit corpus.txt --topics 20 --lang ita --parser udpipe --out model.json
 scptm-bow topics model.json
-scptm-bow evaluate model.json heldout.txt
+scptm-bow evaluate model.json heldout.txt      # held-out perplexity
 ```
 
----
+## Metrics
 
-## Why this is more than a model zoo
+`scptm.metrics` and `scptm_bow.metrics` return the same keys —
+`c_v` (Röder et al. 2015), `npmi`, `diversity`, `exclusivity`, `redundancy` — so
+scores from the two packages are comparable. Both implementations are checked
+against a frozen fixture in [`conformance/`](conformance), so a divergence
+between them fails a test rather than going unnoticed.
 
-Three things here are unusual for a topic-modelling package, and they exist
-because a topic number is meaningless without them.
+## Evaluation utilities
 
-**A control condition for the syntax claim.** Is it the *content* of the
-dependency edges, or just having more regularisation? `random_graph_matched`
-answers that literally: 2-edge swaps preserve every word's degree exactly while
-destroying the topology, so the only thing removed is the linguistic pairing.
+`scptm_bow` also contains the pieces needed to report a comparison rather than a
+point estimate:
 
-```python
-from scptm_bow.graphs import random_graph_matched
-control = random_graph_matched(model.syntax_graph, seed=0)   # same degrees, random edges
-```
-
-**Intervals instead of point estimates.** `stats.paired_bootstrap_ci` pairs two
-models on the same seed and reports the difference with a confidence interval;
-Cliff's delta gives the effect size. And when a design *cannot* support a claim,
-the package says so instead of silently returning p > 0.05:
-
-```
-wilcoxon: n=3: the smallest attainable two-sided p is 0.250, above alpha=0.05.
-          Use the paired bootstrap CI instead.
-```
-
-**A benchmark as data, not as a script.** `BenchmarkSpec` declares the grid
-(corpora × models × seeds × K), the runner is resumable, and the comparison
-emits a booktabs table:
-
-```python
-from scptm_bow import BenchmarkSpec, ModelSpec, compare, run, to_latex
-
-spec = BenchmarkSpec(
-    corpora={"eu_debates": docs_eu, "ng20": docs_ng},
-    models=[ModelSpec("lexical", lambda_syntax=0.0),
-            ModelSpec("syntax",  lambda_syntax=0.1),
-            ModelSpec("control", lambda_syntax=0.1, control="swap")],
-    seeds=[0, 1, 2, 3, 4, 5], topics=[10, 20],
-)
-records = run(spec, out="bench.csv")
-print(to_latex(compare(records, metric="c_v",
-                       treatment="syntax", baseline="control")))
-```
-
----
+- `graphs.random_graph_matched(graph)` — 2-edge-swap randomisation that preserves
+  each word's degree and the edge count, so the syntactic edges can be compared
+  against a graph with the same size but no linguistic content.
+- `stats.paired_bootstrap_ci(a, b)` — confidence interval for the difference
+  between two models measured on the same seeds; `cliffs_delta` for the effect
+  size. `wilcoxon_paired` warns when the sample is too small for the test to be
+  able to reject.
+- `BenchmarkSpec` / `run` / `compare` — a resumable corpus × model × seed × K
+  sweep that writes one row per fit and emits a booktabs table.
+- `model.heldout_perplexity(docs)`, `model.bootstrap()`,
+  `model.estimate_effect(covariates)`, `model.temporal_prevalence(timestamps)`.
 
 ## Repository layout
 
 ```
 packages/
-  scptm/        src layout · tests · README · CITATION   → PyPI: scptm
-  scptm-bow/    src layout · tests · README · CITATION   → PyPI: scptm-bow
-conformance/    the frozen fixture both packages must reproduce
-paper/          the paper's analyses, figures, and data provenance
-.github/        ci.yml (lint + 121 tests, py3.10–3.12) · publish.yml (Trusted Publishing)
+  scptm/        src layout, tests, README, CITATION
+  scptm-bow/    src layout, tests, README, CITATION
+conformance/    shared metric fixture, reproduced by both test suites
+paper/          the paper's analyses and figures; paper/DATA.md = data provenance
+.github/        ci.yml (lint + 121 tests, Python 3.10-3.12), publish.yml
 ```
 
-Both packages use a `src/` layout, so importing the source directory instead of
-the installed package is structurally impossible.
+Local setup:
 
 ```bash
 git clone https://github.com/a-meneghini/scptm && cd scptm
 python -m venv .venv && . .venv/bin/activate
 pip install -e packages/scptm -e packages/scptm-bow
-for f in packages/*/tests/test_*.py; do python "$f" || exit 1; done   # 121 tests
+for f in packages/*/tests/test_*.py; do python "$f" || exit 1; done
 ```
 
 ## Data
 
 No corpus is redistributed here. [`paper/DATA.md`](paper/DATA.md) records the
-source, licence and reproduction contract for each dataset — including how to
-rebuild an equivalent corpus where the original cannot be reshared.
+source, licence and reproduction notes for each dataset used in the paper.
 
 ## Citation
 
-If you use either package, please cite the paper — *Does Syntax Matter? A
-Graph-Augmented Variational Topic Model for Computational Social Sciences* — and
-the software (see [`CITATION.cff`](CITATION.cff)).
+See [`CITATION.cff`](CITATION.cff). Reference paper: *Does Syntax Matter? A
+Graph-Augmented Variational Topic Model for Computational Social Sciences*.
 
 ## Licence
 
