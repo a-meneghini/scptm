@@ -47,3 +47,25 @@ visuals.ipynb
 
 # Benchmark cache directory
 benchmark_cache/
+
+# Build artifacts (both distributions)
+dist/
+dist-bow/
+scptm-bow/dist/
+*.whl
+*.tar.gz
+
+# Local exploration notebooks (contain outputs and personal paths)
+notebook_bowscptm.ipynb
+
+# --- dati e artefatti locali: mai nel repo pubblico -------------------------
+# corpora (il piu' grande e' 129 MB: GitHub rifiuta i file sopra 100 MB)
+*.csv
+_archive/
+node_modules/
+package.json
+package-lock.json
+
+# notebook locali con output e path personali
+notebook.ipynb
+visuals.ipynb

@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: "If you use SCPTM in academic work, please cite it as below."
+title: "SCPTM: Structural Contextual Probabilistic Topic Model"
+abstract: >-
+  Structure-aware topic modelling for the computational social sciences. SCPTM
+  combines contextual embeddings, dependency-parsed syntactic edges and a
+  variational graph encoder; the companion package scptm-bow provides the
+  count-based, deterministic counterpart.
+authors:
+  - family-names: Meneghini
+    given-names: Alessandro
+    email: alessandro.meneghini@uniud.it
+    affiliation: University of Udine
+repository-code: "https://github.com/a-meneghini/scptm"
+license: MIT
+version: 0.2.2
+date-released: "2026-11-16"
+type: software
+keywords:
+  - topic modelling
+  - computational social science
+  - graph neural networks
+  - syntax
+  - multiword expressions

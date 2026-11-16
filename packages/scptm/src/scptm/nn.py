@@ -59,6 +59,13 @@ import torch.nn.functional as F
 from torch_geometric.nn import GATConv, HeteroConv
 
 
+# Words processed per batched beta chunk.  Contexts are ragged (each word has a
+# different number of occurrences, capped by max_ctx_occurrences), so a chunk is
+# padded to its max context count; 512 x 50 x 384 floats is ~39 MB, which keeps
+# the peak bounded regardless of vocabulary size.
+_BETA_CHUNK = 512
+
+
 class VariationalGraphEncoder(nn.Module):
     """
     Encoder: document embeddings -> (mu, logvar) in topic space.
@@ -289,18 +296,62 @@ class VariationalGraphTopicModel(nn.Module):
         beta_matrix = torch.zeros(K, V, device=device)
 
         with torch.no_grad():
-            topic_embs = self.topic_embeddings   # (K, D)
-            for w_idx, ctx_vecs in enumerate(ctx_embs_list):
-                if ctx_vecs is None or len(ctx_vecs) == 0:
-                    w_static = static_word_embs[w_idx].to(device)
-                    sims = F.cosine_similarity(topic_embs, w_static.unsqueeze(0))
-                else:
-                    ctx = ctx_vecs.to(device)                    # (N, D)
-                    attn_logits = torch.matmul(topic_embs, ctx.T) # (K, N)
-                    attn = F.softmax(attn_logits, dim=-1)
-                    repr_kw = torch.matmul(attn, ctx)            # (K, D)
-                    sims = F.cosine_similarity(topic_embs, repr_kw, dim=-1)
-                beta_matrix[:, w_idx] = sims
+            topic_embs = self.topic_embeddings                    # (K, D)
+            d = topic_embs.shape[1]
+
+            # 1) Words without contexts fall back to their static SBERT vector;
+            #    all of them are handled by a single batched cosine.
+            no_ctx = [
+                w for w, c in enumerate(ctx_embs_list) if c is None or len(c) == 0
+            ]
+            if no_ctx:
+                idx = torch.as_tensor(no_ctx, dtype=torch.long, device=device)
+                w_static = static_word_embs.to(device)[idx]       # (B, D)
+                beta_matrix[:, idx] = F.cosine_similarity(
+                    topic_embs.unsqueeze(1), w_static.unsqueeze(0), dim=-1
+                )
+
+            # 2) Words with contexts have a ragged number of them, so process
+            #    them in chunks padded to the chunk's max count.  Padding gets
+            #    -inf logits, which makes the softmax identical to a per-word
+            #    softmax.  This replaces a Python loop over the whole vocabulary
+            #    (and a device write per word) with a few batched matmuls.
+            with_ctx = [
+                (w, c) for w, c in enumerate(ctx_embs_list)
+                if c is not None and len(c) > 0
+            ]
+            for start in range(0, len(with_ctx), _BETA_CHUNK):
+                part = with_ctx[start:start + _BETA_CHUNK]
+                b = len(part)
+                n_max = max(len(c) for _, c in part)
+
+                # Built on CPU so the whole chunk is transferred once.
+                pad = torch.zeros(b, n_max, d)
+                mask = torch.zeros(b, n_max, dtype=torch.bool)
+                for row, (_, c) in enumerate(part):
+                    n = len(c)
+                    cpu_c = (
+                        c.detach().to("cpu", torch.float32)
+                        if torch.is_tensor(c)
+                        else torch.as_tensor(c, dtype=torch.float32)
+                    )
+                    pad[row, :n] = cpu_c
+                    mask[row, :n] = True
+
+                pad = pad.to(device)
+                logits = torch.matmul(pad, topic_embs.T)          # (B, N, K)
+                logits = logits.masked_fill(
+                    ~mask.to(device).unsqueeze(-1), float("-inf")
+                )
+                attn = torch.nan_to_num(F.softmax(logits, dim=1))
+                repr_kw = torch.einsum("bnk,bnd->bkd", attn, pad)  # (B, K, D)
+                sims = F.cosine_similarity(
+                    repr_kw, topic_embs.unsqueeze(0), dim=-1
+                )                                                  # (B, K)
+                idx = torch.as_tensor(
+                    [w for w, _ in part], dtype=torch.long, device=device
+                )
+                beta_matrix[:, idx] = sims.T
 
         self._cached_beta = F.softmax(beta_matrix / self.beta_temperature, dim=-1)
         self._beta_dirty = False

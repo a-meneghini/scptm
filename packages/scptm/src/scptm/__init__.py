@@ -22,10 +22,19 @@ Author: Alessandro Meneghini
 License: MIT
 """
 
+from . import metrics, stats
 from .model import SCPTM
-from .config import SCPTMConfig
+from .config import SCPTMConfig, resolve_device
 from .evaluation import SCPTMEvaluator
+from .nlp import clear_pipeline_cache
 from .selection import search_k
 
-__version__ = "0.2.1"
-__all__ = ["SCPTM", "SCPTMConfig", "SCPTMEvaluator", "search_k"]
+__version__ = "0.2.2"
+__all__ = [
+    "SCPTM",
+    "SCPTMConfig",
+    "SCPTMEvaluator",
+    "search_k",
+    "resolve_device",
+    "clear_pipeline_cache",
+]

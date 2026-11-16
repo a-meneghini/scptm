@@ -1,0 +1,71 @@
+name: publish
+
+# Two independent distributions live in this repository and are released
+# independently.  Authentication uses PyPI Trusted Publishing (OIDC): no API
+# token is ever stored in the repository or in a secret.
+#
+# One-time setup on PyPI (Account -> Publishing):
+#   * existing project "scptm"                -> add a pending/active publisher
+#                                                 for this repo + workflow file
+#   * new project "scptm-bow"                 -> "pending publisher" with the
+#                                                 same coordinates; it is created
+#                                                 on the first successful upload
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install build twine
+      - name: Build scptm
+        run: python -m build ./packages/scptm --outdir dist
+      - name: Build scptm-bow
+        run: python -m build ./packages/scptm-bow --outdir dist-bow
+      - name: Validate metadata
+        run: twine check dist/* dist-bow/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-scptm
+          path: dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-scptm-bow
+          path: dist-bow/
+
+  publish-scptm:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-scptm
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+
+  publish-scptm-bow:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-scptm-bow
+          path: dist-bow/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist-bow/

@@ -1,0 +1,15 @@
+# Monorepo lint configuration. The packages have no per-package ruff config.
+line-length = 100
+target-version = "py310"
+src = ["packages/scptm/src", "packages/scptm-bow/src"]
+
+[lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = [
+    "E501",   # line length is a formatter concern
+    "B008",   # function calls in argument defaults (dataclasses, `lambda` in tests)
+]
+
+[lint.per-file-ignores]
+"**/tests/*" = ["E402", "B011"]
+"conformance/*" = ["E402"]

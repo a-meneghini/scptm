@@ -1,0 +1,13 @@
+# --- scptm source distribution ---------------------------------------------
+#
+# This file describes ONE package.  scptm-bow is a separate distribution and
+# lives in packages/scptm-bow/ — it is outside this directory, so it can no
+# longer leak into this sdist by accident (it used to be nested here, which
+# required an explicit `prune`; now the layout makes it impossible).
+
+include LICENSE
+include README.md
+include CITATION.cff
+recursive-include tests *.py
+
+global-exclude __pycache__/* *.py[cod] .DS_Store

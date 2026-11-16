@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: "If you use SCPTM or SCPTM-bow in academic work, please cite them as below."
+title: "SCPTM: structure-aware topic modelling (neural and count-based)"
+abstract: >-
+  Two independent implementations of syntax-aware topic modelling: scptm
+  (contextual embeddings, dependency graph, variational graph encoder) and
+  scptm-bow (dependency-regularised NMF over a lemmatised bag of words).
+authors:
+  - family-names: Meneghini
+    given-names: Alessandro
+    email: alessandro.meneghini@uniud.it
+    affiliation: University of Udine
+repository-code: "https://github.com/a-meneghini/scptm"
+license: MIT
+date-released: "2026-11-16"
+type: software
+keywords:
+  - topic modelling
+  - computational social science
+  - syntax
+  - non-negative matrix factorisation
+  - graph neural networks

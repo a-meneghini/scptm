@@ -4,7 +4,39 @@ scptm/selection.py
 Automatic selection of the optimal number of topics K.
 """
 
+import math
+import warnings
 from typing import Dict, List, Optional, Sequence, Tuple
+
+
+def _last_history_value(history: dict, key: str) -> float:
+    """Last recorded value for ``key``, or NaN when it was never recorded."""
+    values = history.get(key) or []
+    if not values:
+        return float("nan")
+    try:
+        return float(values[-1])
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _best_finite_k(results: Dict[int, dict]) -> int:
+    """
+    K with the highest *finite* score.
+
+    ``max()`` over a dict is order-dependent once a NaN is involved: NaN
+    comparisons are always False, so a NaN entry wins whenever it comes first
+    and is ignored when it comes later.  Non-finite scores are dropped here so
+    the choice is deterministic.
+    """
+    finite = {k: r for k, r in results.items() if math.isfinite(r["score"])}
+    if not finite:
+        raise RuntimeError(
+            "search_k: no K produced a finite score. Metrics were probably "
+            "never recorded (check metrics_every_n_epochs) or the corpus is "
+            "too small for NPMI/diversity to be defined."
+        )
+    return max(finite, key=lambda k: finite[k]["score"])
 
 
 def search_k(
@@ -56,7 +88,15 @@ def search_k(
         Fitted model for best_k.
     results : dict
         {K: {"model": SCPTM, "npmi": float, "div": float, "score": float}}
-        for every K evaluated.
+        for every K evaluated.  K values that failed to train carry
+        ``model=None``, NaN metrics and an ``error`` string; they are skipped
+        when picking the best K, and a K whose score is NaN/inf is never
+        selected.
+
+    Raises
+    ------
+    RuntimeError
+        If no K produced a finite score.
     """
     from .model import SCPTM
 
@@ -67,14 +107,36 @@ def search_k(
     results: Dict = {}
 
     def _fit_k(K: int) -> dict:
-        m = SCPTM(num_topics=K, epochs=epochs,
-                  metrics_every_n_epochs=epochs, **kwargs)
-        m.fit_transform(docs, edge_cache_path=edge_cache_path,
-                        covariate=covariate)
+        try:
+            m = SCPTM(num_topics=K, epochs=epochs,
+                      metrics_every_n_epochs=epochs, **kwargs)
+            m.fit_transform(docs, edge_cache_path=edge_cache_path,
+                            covariate=covariate)
+        except Exception as exc:                      # noqa: BLE001
+            # One bad K must not abort the whole sweep.
+            warnings.warn(
+                f"[search_k] K={K} failed ({type(exc).__name__}: {exc}) and was "
+                "skipped.",
+                stacklevel=2,
+            )
+            return {
+                "model": None,
+                "npmi": float("nan"),
+                "div": float("nan"),
+                "score": float("nan"),
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
         history = m._history or {}
-        npmi  = history.get("coherence_npmi",  [0.0])[-1]
-        div   = history.get("topic_diversity", [0.0])[-1]
+        npmi  = _last_history_value(history, "coherence_npmi")
+        div   = _last_history_value(history, "topic_diversity")
         score = npmi * div
+        if not math.isfinite(score):
+            warnings.warn(
+                f"[search_k] K={K} produced a non-finite score "
+                f"(npmi={npmi}, diversity={div}); it will not be selected.",
+                stacklevel=2,
+            )
         if verbose:
             print(f"  K={K:3d}  NPMI={npmi:+.3f}  Div={div:.3f}  Score={score:+.4f}")
         return {"model": m, "npmi": npmi, "div": div, "score": score}
@@ -84,7 +146,7 @@ def search_k(
     for K in k_grid:
         results[K] = _fit_k(K)
 
-    best_K = max(results, key=lambda k: results[k]["score"])
+    best_K = _best_finite_k(results)
 
     if finetune and len(k_grid) >= 2:
         idx = k_grid.index(best_K)
@@ -97,7 +159,7 @@ def search_k(
                 print(f"\n[search_k] Fine-tuning around K={best_K}: {fine_grid}")
             for K in fine_grid:
                 results[K] = _fit_k(K)
-            best_K = max(results, key=lambda k: results[k]["score"])
+            best_K = _best_finite_k(results)
 
     if verbose:
         print(

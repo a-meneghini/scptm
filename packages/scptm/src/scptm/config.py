@@ -6,8 +6,10 @@ All hyper-parameters in one place.
 
 Quick reference
 ---------------
-SCPTMConfig is a frozen-style dataclass; all fields have sensible defaults.
+SCPTMConfig is a plain dataclass; all fields have sensible defaults.
 Pass it to SCPTM(config=cfg) or use keyword shortcuts SCPTM(num_topics=15).
+SCPTM.fit() never mutates the config you pass: anything it needs to adjust for
+the run (e.g. neighbour sampling) is applied to a private copy.
 
 Most important parameters for tuning results:
 
@@ -23,9 +25,12 @@ Most important parameters for tuning results:
   topic_diversity_weight — increase to 0.2+ if topics collapse
   lang                — "eng" (all-MiniLM-L6-v2) or "ita"
                         (paraphrase-multilingual-MiniLM-L12-v2)
+  lemmatizer          — "spacy" (default) or "udpipe" (pretrained UDPipe UD
+                        models, optional `ufal.udpipe` dependency)
+  device              — "auto" (default; CUDA → MPS → CPU), "cpu", "cuda", "mps"
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal, Optional
 
 
@@ -36,6 +41,12 @@ GRAPH_MODES = {
     "full_dep":  "All content dependency types (word-word)",
     "filtered":  "Informative dependency types only (default)",
 }
+
+# Devices understood by SCPTMConfig.device.
+DEVICES = ("auto", "cpu", "cuda", "mps")
+
+# Languages with a supported SBERT / lemmatiser pipeline.
+SUPPORTED_LANGS = ("eng", "ita")
 
 # Dependency relation sets used in 'filtered' and 'full_dep' modes.
 # "obj" is the Universal Dependencies v2 label used by Italian (and newer
@@ -77,6 +88,19 @@ class SCPTMConfig:
         One of {"none", "no_syntax", "full_dep", "filtered"}.
     lang : str
         Language code: "eng" or "ita".
+    lemmatizer : str
+        Lemmatisation / dependency-parsing backend: "spacy" (default) or
+        "udpipe".  "udpipe" uses pretrained Universal Dependencies models via
+        the optional ``ufal.udpipe`` package; see ``udpipe_model_path`` and
+        ``udpipe_cache_dir``.  Both backends expose the same token interface,
+        so the rest of the model is unaffected by the choice.
+    udpipe_model_path : str | None
+        Explicit path to a ``.udpipe`` model for the selected ``lang``.  When
+        None the model is looked up through the ``SCPTM_UDPIPE_MODEL_{ENG,ITA}``
+        environment variables and then auto-downloaded into ``udpipe_cache_dir``.
+    udpipe_cache_dir : str | None
+        Directory for auto-downloaded UDPipe models.  Defaults to
+        ``$SCPTM_UDPIPE_MODEL_DIR`` or ``~/.cache/scptm/udpipe``.
     kl_max : float
         Maximum KL weight after annealing.
     kl_warmup_epochs : int
@@ -105,9 +129,15 @@ class SCPTMConfig:
         Keyword ranking method: "cosine" (default, beta/cosine similarity) or
         "ctfidf" (class-based TF-IDF, treats each topic as a document class).
     use_mixed_precision : bool
-        Enable torch.cuda.amp (GPU only).
+        Enable torch.cuda.amp (CUDA only; ignored on CPU/MPS).
     use_neighbor_sampling : bool
         Use PyG NeighborLoader for mini-batch GNN training.
+        Not supported on MPS (pyg-lib/torch-sparse are CUDA/CPU only) and is
+        force-disabled with a warning when device resolves to MPS.
+    device : str
+        Compute device: "auto" (default), "cpu", "cuda" or "mps".
+        "auto" prefers CUDA, then Apple Metal (MPS), then CPU.  An explicit
+        "cuda"/"mps" raises if that accelerator is unavailable.
     apply_chunking : bool
         Split long documents into overlapping chunks.
     max_chunk_chars : int
@@ -126,6 +156,15 @@ class SCPTMConfig:
     lang: Literal["eng", "ita"] = "eng"
     apply_chunking: bool = True
     max_chunk_chars: int = 800
+
+    # ---- NLP backend ----
+    # "spacy"  — spaCy statistical pipelines (en_core_web_sm / it_core_news_sm).
+    # "udpipe" — pretrained UDPipe Universal Dependencies models (optional
+    #            `ufal.udpipe` dependency; stronger lemmatisation for
+    #            morphologically rich languages such as Italian).
+    lemmatizer: Literal["spacy", "udpipe"] = "spacy"
+    udpipe_model_path: Optional[str] = None
+    udpipe_cache_dir: Optional[str] = None
 
     # ---- Training ----
     epochs: int = 50
@@ -165,6 +204,11 @@ class SCPTMConfig:
     metrics_every_n_epochs: int = 10
 
     # ---- Hardware ----
+    # device: "auto" | "cpu" | "cuda" | "mps".
+    # "auto" prefers CUDA, then Apple Metal (MPS), then CPU.  An explicit
+    # "cuda"/"mps" raises if the accelerator is unavailable (see
+    # resolve_device), so a silent CPU fallback can never mask a typo.
+    device: Literal["auto", "cpu", "cuda", "mps"] = "auto"
     use_mixed_precision: bool = True
     use_neighbor_sampling: bool = False
 
@@ -231,15 +275,117 @@ class SCPTMConfig:
     random_state: int = 42
 
     def __post_init__(self):
-        assert self.graph_mode in GRAPH_MODES, (
-            f"graph_mode must be one of {list(GRAPH_MODES)}, got '{self.graph_mode}'"
-        )
-        assert self.kl_strategy in ("linear", "cyclical", "constant"), (
-            f"kl_strategy must be linear/cyclical/constant, got '{self.kl_strategy}'"
-        )
-        assert self.bow_normalization in ("none", "tf", "log1p"), (
-            f"bow_normalization must be none/tf/log1p, got '{self.bow_normalization}'"
-        )
-        assert self.keyword_method in ("cosine", "ctfidf"), (
-            f"keyword_method must be cosine/ctfidf, got '{self.keyword_method}'"
-        )
+        # Plain ValueError rather than assert: asserts are stripped under
+        # `python -O`, which would let an invalid config through silently and
+        # only surface much later as a confusing failure.
+        if self.graph_mode not in GRAPH_MODES:
+            raise ValueError(
+                f"graph_mode must be one of {list(GRAPH_MODES)}, got '{self.graph_mode}'"
+            )
+        if self.kl_strategy not in ("linear", "cyclical", "constant"):
+            raise ValueError(
+                f"kl_strategy must be linear/cyclical/constant, got '{self.kl_strategy}'"
+            )
+        if self.bow_normalization not in ("none", "tf", "log1p"):
+            raise ValueError(
+                f"bow_normalization must be none/tf/log1p, got '{self.bow_normalization}'"
+            )
+        if self.keyword_method not in ("cosine", "ctfidf"):
+            raise ValueError(
+                f"keyword_method must be cosine/ctfidf, got '{self.keyword_method}'"
+            )
+        if self.lemmatizer not in ("spacy", "udpipe"):
+            raise ValueError(
+                f"lemmatizer must be spacy/udpipe, got '{self.lemmatizer}'"
+            )
+        if self.device not in DEVICES:
+            raise ValueError(
+                f"device must be one of {list(DEVICES)}, got '{self.device}'"
+            )
+        if self.lang not in SUPPORTED_LANGS:
+            raise ValueError(
+                f"lang must be one of {list(SUPPORTED_LANGS)}, got '{self.lang}'"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Device / optional-dependency capabilities
+# ---------------------------------------------------------------------------
+
+def neighbor_sampling_available() -> bool:
+    """
+    Return True when PyG neighbour sampling can actually run.
+
+    ``torch_geometric.loader.NeighborLoader`` imports fine without the optional
+    accelerators, but raises ``ImportError`` only when the first batch is
+    sampled.  Checking up front lets SCPTM fall back to full-batch training
+    instead of crashing mid-epoch on machines without ``pyg-lib`` /
+    ``torch-sparse`` (which need glibc >= 2.32 and often cannot be installed).
+    """
+    from importlib.util import find_spec
+
+    return find_spec("pyg_lib") is not None or find_spec("torch_sparse") is not None
+
+
+def _mps_available() -> bool:
+    """Return True when Apple Metal (MPS) is available (guarded for old torch)."""
+    try:
+        import torch
+
+        return bool(torch.backends.mps.is_available())
+    except Exception:                       # pragma: no cover - torch always present
+        return False
+
+
+def resolve_device(device: str = "auto") -> "torch.device":
+    """
+    Resolve the ``SCPTMConfig.device`` string to a concrete ``torch.device``.
+
+    Parameters
+    ----------
+    device : str
+        "auto" (default), "cpu", "cuda" or "mps".
+        "auto" prefers CUDA, then Apple Metal (MPS), then CPU.
+
+    Returns
+    -------
+    torch.device
+
+    Raises
+    ------
+    ValueError
+        If ``device`` is not one of :data:`DEVICES`.
+    RuntimeError
+        If ``device`` explicitly requests an accelerator that is unavailable.
+    """
+    import torch  # local import: keeps SCPTMConfig importable without torch
+
+    if device not in DEVICES:
+        raise ValueError(f"device must be one of {list(DEVICES)}, got '{device}'")
+
+    if device == "cpu":
+        return torch.device("cpu")
+
+    if device == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "device='cuda' was requested but CUDA is not available. "
+                "Use device='auto' to fall back to the best available device."
+            )
+        return torch.device("cuda")
+
+    if device == "mps":
+        if not _mps_available():
+            raise RuntimeError(
+                "device='mps' was requested but Apple Metal (MPS) is not "
+                "available. Use device='auto' to fall back to the best "
+                "available device."
+            )
+        return torch.device("mps")
+
+    # "auto"
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if _mps_available():
+        return torch.device("mps")
+    return torch.device("cpu")

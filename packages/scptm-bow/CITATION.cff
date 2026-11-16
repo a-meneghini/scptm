@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: "If you use SCPTM-bow in academic work, please cite it as below."
+title: "SCPTM-bow: structure-aware topic modelling without neural embeddings"
+abstract: >-
+  Dependency-regularised non-negative matrix factorisation over a lemmatised
+  bag of words, with fastText vectors and multiword-expression extraction. The
+  deterministic, CPU-only counterpart to SCPTM.
+authors:
+  - family-names: Meneghini
+    given-names: Alessandro
+    email: alessandro.meneghini@uniud.it
+    affiliation: University of Udine
+repository-code: "https://github.com/a-meneghini/scptm"
+license: MIT
+version: 0.2.0
+date-released: "2026-11-16"
+type: software
+keywords:
+  - topic modelling
+  - non-negative matrix factorisation
+  - syntax
+  - multiword expressions

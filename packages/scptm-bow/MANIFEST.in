@@ -1,0 +1,4 @@
+include LICENSE
+include README.md
+recursive-include tests *.py
+global-exclude __pycache__/* *.py[cod] .DS_Store

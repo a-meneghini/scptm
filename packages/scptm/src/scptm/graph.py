@@ -20,7 +20,12 @@ build_hetero_graph(documents, sbert_model, nlp_model, stop_words, cfg,
 
     When edge_cache_path is provided:
       * First run  — parses corpus, encodes SBERT embeddings, writes all to cache.
-      * Later runs — loads from cache, skips spaCy AND SBERT encode entirely.
+      * Later runs — loads from cache, skips lemmatisation/parsing AND SBERT
+        encode entirely.
+      * A cache is reused only when its signature matches (see
+        :func:`_cache_signature`): corpus content hash, lang, lemmatizer,
+        graph_mode, min_df and max_features.  Any change triggers an automatic
+        rebuild with a warning naming the changed field.
 
 collect_contextual_embeddings(documents, nlp_model, sbert_model, vocab,
                                max_occurrences_per_word) → dict
@@ -37,9 +42,11 @@ estimate_graph_memory(n_docs, vocab_size, n_edges_dw, n_edges_ww, ...) → dict
     the estimate exceeds 8 GB).
 """
 
+import hashlib
 import math
 import os
 import pickle
+import re
 import warnings
 from collections import defaultdict
 from pathlib import Path
@@ -60,9 +67,35 @@ from .config import (
 )
 
 
+# Token pattern for the vocabulary CountVectorizer: at least two Unicode
+# letters, no digits or underscores.
+#
+# The previous pattern was r"(?u)\b[a-zA-Z][a-zA-Z]+\b", which silently dropped
+# every accented word — in Italian that meant losing "città", "però", "più",
+# "società", "università", … because there is no word boundary between "t" and
+# "à" (both are word characters under Unicode).  [^\W\d_] is "a word character
+# that is neither a digit nor an underscore", i.e. any Unicode letter.
+VOCAB_TOKEN_PATTERN = r"(?u)\b[^\W\d_]{2,}\b"
+
+# Minimum length (characters, after whitespace normalisation) for a raw
+# document to become a segment.  Documents at or below this are dropped, both
+# with and without chunking, so the two paths stay consistent.
+MIN_DOC_CHARS = 10
+
+
 # ---------------------------------------------------------------------------
 # Corpus helpers
 # ---------------------------------------------------------------------------
+
+def _split_sentences(text: str) -> List[str]:
+    """Split on sentence-final punctuation followed by whitespace.
+
+    The previous implementation used ``text.split(". ")``, which missed "? ",
+    "! " and ".<newline>" and then re-appended a "." to every chunk, producing
+    doubled punctuation such as "..".
+    """
+    return [s for s in re.split(r"(?<=[.!?])\s+", text) if s]
+
 
 def prepare_corpus(
     source,
@@ -80,7 +113,7 @@ def prepare_corpus(
     source : str | pd.DataFrame
         Path to a folder of .txt files, or a DataFrame.
     source_type : str
-        "folder" or "dataframe".
+        "folder", "dataframe" or "list".
     text_col : str | None
         Column name when source_type == "dataframe".
     apply_chunking : bool
@@ -90,6 +123,14 @@ def prepare_corpus(
     return_doc_indices : bool
         If True, also return a list mapping each segment to its source
         document index (useful for aligning per-document covariates).
+
+    Notes
+    -----
+    Documents shorter than :data:`MIN_DOC_CHARS` characters are dropped, with
+    and without chunking.  Every other document contributes at least one
+    segment (the trailing chunk of a long document is kept even when short).
+    Dropped documents are absent from ``doc_indices`` too, so covariate
+    alignment stays consistent.
 
     Returns
     -------
@@ -127,7 +168,7 @@ def prepare_corpus(
         docs: List[str] = []
         doc_indices: List[int] = []
         for doc_idx, t in enumerate(raw):
-            if len(t.strip()) > 10:
+            if len(t.strip()) > MIN_DOC_CHARS:
                 docs.append(" ".join(t.split()))
                 doc_indices.append(doc_idx)
         return (docs, doc_indices) if return_doc_indices else docs
@@ -136,20 +177,25 @@ def prepare_corpus(
     doc_indices = []
     for doc_idx, text in enumerate(raw):
         clean = " ".join(text.split())
-        sentences = clean.split(". ")
+        # Same minimum length as the no-chunking branch.  The trailing chunk is
+        # always kept: the old `if len(chunk) > 50` silently discarded the last
+        # piece of every document — and *entire* documents under 50 characters,
+        # including their entry in doc_indices.
+        if len(clean) <= MIN_DOC_CHARS:
+            continue
+        sentences = _split_sentences(clean)
         chunk = ""
         for sent in sentences:
-            sent = sent.strip()
             if not sent:
                 continue
-            if len(chunk) + len(sent) > max_chunk_chars and chunk:
-                docs.append(chunk + ".")
+            if chunk and len(chunk) + 1 + len(sent) > max_chunk_chars:
+                docs.append(chunk)
                 doc_indices.append(doc_idx)
                 chunk = sent
             else:
-                chunk = chunk + ". " + sent if chunk else sent
-        if len(chunk) > 50:
-            docs.append(chunk + ".")
+                chunk = f"{chunk} {sent}" if chunk else sent
+        if chunk:
+            docs.append(chunk)
             doc_indices.append(doc_idx)
 
     print(f"Final corpus: {len(docs)} segments.")
@@ -160,16 +206,49 @@ def prepare_corpus(
 # Contextual embeddings per word
 # ---------------------------------------------------------------------------
 
+def _iter_parsed(nlp_model, documents: List[str], batch_size: int = 64):
+    """
+    Iterate parsed documents, batching through ``nlp_model.pipe`` when available.
+
+    ``spacy.Language.pipe`` batches tokenisation/tagging/parsing and is ~1.3x
+    faster than a per-document loop; :class:`scptm.nlp.UDPipePipeline` exposes
+    the same method for API parity (sequential internally).
+    """
+    pipe = getattr(nlp_model, "pipe", None)
+    if callable(pipe):
+        yield from pipe(documents, batch_size=batch_size)
+    else:                                   # pragma: no cover - custom backend
+        for text in documents:
+            yield nlp_model(text)
+
+
 def collect_contextual_embeddings(
     documents: List[str],
     nlp_model,
     sbert_model,
     vocab: dict,
     max_occurrences_per_word: int = 50,
+    random_state: int = 42,
+    doc_embeddings=None,
+    batch_size: int = 64,
 ) -> dict:
     """
     For each vocabulary word, collect up to `max_occurrences_per_word` SBERT
     document embeddings from contexts where the word appears.
+
+    Parameters
+    ----------
+    random_state : int
+        Seed for the per-word subsampling.  Was hardcoded to 42, which made the
+        pass reproducible but not controllable via ``SCPTMConfig.random_state``.
+    doc_embeddings : array-like | None
+        Pre-computed SBERT document embeddings, one row per document (the same
+        matrix :func:`build_hetero_graph` already stores on the ``doc`` nodes).
+        When provided, SBERT is not called at all.  When ``None`` the documents
+        are encoded **in one batched call** (the previous implementation
+        encoded them one at a time, ~8x slower).
+    batch_size : int
+        Batch size for both the SBERT encoding and ``nlp_model.pipe``.
 
     Returns
     -------
@@ -179,11 +258,22 @@ def collect_contextual_embeddings(
     print("Collecting contextual embeddings (REV-A)...")
     ctx_embs = defaultdict(list)
 
-    for text in tqdm(documents, desc="Contextual embeddings"):
-        doc_vec = sbert_model.encode(text)
-        spacy_doc = nlp_model(text)
+    if doc_embeddings is None:
+        doc_embeddings = sbert_model.encode(
+            documents, batch_size=batch_size, show_progress_bar=True
+        )
+    if len(doc_embeddings) != len(documents):
+        raise ValueError(
+            f"doc_embeddings has {len(doc_embeddings)} rows but there are "
+            f"{len(documents)} documents."
+        )
+
+    parsed_docs = _iter_parsed(nlp_model, documents, batch_size=batch_size)
+    for doc_vec, parsed in zip(
+        tqdm(doc_embeddings, desc="Contextual embeddings"), parsed_docs
+    ):
         seen = set()
-        for token in spacy_doc:
+        for token in parsed:
             if token.is_stop or not token.is_alpha or len(token.lemma_) <= 2:
                 continue
             lemma = token.lemma_.lower()
@@ -193,7 +283,7 @@ def collect_contextual_embeddings(
             ctx_embs[lemma].append(doc_vec)
 
     # Subsample to max_occurrences_per_word
-    rng = np.random.default_rng(42)
+    rng = np.random.default_rng(random_state)
     for w in ctx_embs:
         if len(ctx_embs[w]) > max_occurrences_per_word:
             idx = rng.choice(len(ctx_embs[w]), max_occurrences_per_word, replace=False)
@@ -209,8 +299,62 @@ def collect_contextual_embeddings(
 
 
 # ---------------------------------------------------------------------------
-# Parse cache (edge list + vocabulary) — avoid re-running spaCy on reload
+# Parse cache (edge list + vocabulary) — avoid re-running the NLP parse on reload
 # ---------------------------------------------------------------------------
+
+def _corpus_hash(documents: List[str]) -> str:
+    """Short, order-sensitive hash of the corpus contents.
+
+    Updated incrementally so a huge corpus never needs a second full copy in
+    memory.  Captures chunking/content changes that ``n_docs`` alone misses
+    (e.g. editing the text without changing the document count).
+    """
+    h = hashlib.sha1()
+    for doc in documents:
+        h.update(str(doc).encode("utf-8", errors="replace"))
+        h.update(b"\x00")
+    return h.hexdigest()[:16]
+
+
+def _cache_signature(cfg: SCPTMConfig, documents: List[str]) -> dict:
+    """
+    Everything the parse cache depends on, so a stale cache can never be
+    silently reused.
+
+    Cached artifacts and their inputs:
+      * vocab_arr / bow_sparse      → corpus content, lang, lemmatizer,
+                                      min_df, max_features, token pattern
+      * doc/word-word edge lists    → graph_mode
+      * doc_embs / word_embs_static → corpus content, vocabulary, lang (SBERT)
+    """
+    return {
+        "content_hash":  _corpus_hash(documents),
+        "n_docs":        len(documents),
+        "lang":          getattr(cfg, "lang", "eng"),
+        "lemmatizer":    getattr(cfg, "lemmatizer", "spacy"),
+        "graph_mode":    getattr(cfg, "graph_mode", "filtered"),
+        "min_df":        getattr(cfg, "min_df", None),
+        "max_features":  getattr(cfg, "max_features", None),
+        # Guards against silently reusing a vocabulary built by an older
+        # tokenizer rule (e.g. the ASCII-only pattern that dropped accented
+        # Italian words).  Bump/change the pattern and caches rebuild.
+        "token_pattern": VOCAB_TOKEN_PATTERN,
+    }
+
+
+def _signature_diff(cached: dict, current: dict) -> List[str]:
+    """Return human-readable reasons why ``cached`` no longer matches ``current``."""
+    reasons = []
+    for key, value in current.items():
+        old = cached.get(key)
+        if old == value:
+            continue
+        if key == "content_hash":
+            reasons.append("corpus content changed (same document count)")
+        else:
+            reasons.append(f"{key}: {old!r} -> {value!r}")
+    return reasons
+
 
 def _save_parse_cache(
     path: Union[str, Path],
@@ -224,11 +368,17 @@ def _save_parse_cache(
     doc_embs: Optional[np.ndarray] = None,
     word_embs_static: Optional[np.ndarray] = None,
     dep_triples: Optional[dict] = None,
+    signature: Optional[dict] = None,
 ) -> None:
     """Persist the NLP-heavy outputs so they can be reused across runs.
 
     doc_embs and word_embs_static are optional; when provided they are stored
     so that subsequent calls to build_hetero_graph can skip SBERT entirely.
+
+    ``signature`` records the corpus hash and every config field the cached
+    artifacts depend on (see :func:`_cache_signature`), so a cache built with a
+    different backend, graph mode, vocabulary setting or corpus is never
+    silently reused.
     """
     cache = {
         "_n_docs":       n_docs,
@@ -239,6 +389,12 @@ def _save_parse_cache(
         "word_word_src": word_word_src,
         "word_word_dst": word_word_dst,
     }
+    if signature is not None:
+        cache["_signature"] = signature
+        # Flat keys too: the contextual-embedding cache validates them without
+        # needing the whole signature.
+        cache["_lemmatizer"] = signature.get("lemmatizer", "spacy")
+        cache["_lang"]       = signature.get("lang", "eng")
     if doc_embs is not None:
         cache["doc_embs"] = doc_embs
     if word_embs_static is not None:
@@ -253,13 +409,17 @@ def _save_parse_cache(
 def load_ctx_embs_from_cache(
     path: Union[str, Path],
     vocab_size: int,
+    lemmatizer: str = "spacy",
+    lang: str = "eng",
+    max_occurrences: Optional[int] = None,
 ) -> Optional[list]:
     """
     Try to load a previously saved ``ctx_embs_list`` from the parse cache.
 
     Returns the list (one entry per vocabulary word) if the cache file exists
-    **and** was built with the same vocabulary size, otherwise returns ``None``
-    (triggering a fresh ``collect_contextual_embeddings`` call).
+    **and** was built with the same vocabulary size, lemmatisation backend and
+    ``max_ctx_occurrences``, otherwise returns ``None`` (triggering a fresh
+    ``collect_contextual_embeddings`` call).
 
     Parameters
     ----------
@@ -268,6 +428,14 @@ def load_ctx_embs_from_cache(
         onto the same pickle).
     vocab_size : int
         Expected number of entries in the list.
+    lemmatizer : str
+        Active lemmatisation backend; contextual embeddings depend on the
+        tokenisation/lemmas that produced the vocabulary.
+    lang : str
+        Active language code.
+    max_occurrences : int | None
+        Active ``SCPTMConfig.max_ctx_occurrences``; the stored list was
+        subsampled with it, so changing it invalidates the cache.
     """
     if not os.path.exists(path):
         return None
@@ -276,10 +444,23 @@ def load_ctx_embs_from_cache(
     ctx = cache.get("ctx_embs_list")
     if ctx is None:
         return None
+    if (cache.get("_lemmatizer", "spacy"), cache.get("_lang", "eng")) != (lemmatizer, lang):
+        warnings.warn(
+            "[CtxCache] Cache was built with a different lemmatisation backend. "
+            "Ignoring cached contextual embeddings."
+        )
+        return None
     if cache.get("_ctx_vocab_size") != vocab_size:
         warnings.warn(
             f"[CtxCache] Vocabulary size changed ({cache.get('_ctx_vocab_size')} "
             f"→ {vocab_size}).  Ignoring cached contextual embeddings."
+        )
+        return None
+    if max_occurrences is not None and cache.get("_ctx_max_occurrences") != max_occurrences:
+        warnings.warn(
+            f"[CtxCache] max_ctx_occurrences changed "
+            f"({cache.get('_ctx_max_occurrences')} → {max_occurrences}). "
+            "Ignoring cached contextual embeddings."
         )
         return None
     print(f"  [CtxCache] Loaded from '{path}' — skipping contextual embedding pass.")
@@ -289,6 +470,7 @@ def load_ctx_embs_from_cache(
 def save_ctx_embs_to_cache(
     path: Union[str, Path],
     ctx_embs_list: list,
+    max_occurrences: Optional[int] = None,
 ) -> None:
     """
     Persist ``ctx_embs_list`` into the existing parse cache file.
@@ -303,6 +485,8 @@ def save_ctx_embs_to_cache(
         Same file used for the parse cache.
     ctx_embs_list : list
         One entry per vocabulary word — ``torch.Tensor | None``.
+    max_occurrences : int | None
+        ``SCPTMConfig.max_ctx_occurrences`` used to build the list.
     """
     if os.path.exists(path):
         with open(path, "rb") as f:
@@ -311,29 +495,49 @@ def save_ctx_embs_to_cache(
         cache = {}
     cache["ctx_embs_list"]    = ctx_embs_list
     cache["_ctx_vocab_size"]  = len(ctx_embs_list)
+    if max_occurrences is not None:
+        cache["_ctx_max_occurrences"] = max_occurrences
     with open(path, "wb") as f:
         pickle.dump(cache, f)
     print(f"  [CtxCache] Saved to '{path}'")
 
 
-def _load_parse_cache(path: Union[str, Path], n_docs: int):
+def _load_parse_cache(
+    path: Union[str, Path],
+    signature: dict,
+):
     """
-    Load a previously saved parse cache.
+    Load a previously saved parse cache, validating it against ``signature``
+    (see :func:`_cache_signature`).
 
-    Returns the cache dict if the file exists and the corpus size matches,
-    otherwise returns None (triggering a fresh build).
+    Returns the cache dict on an exact signature match, otherwise ``None``
+    (triggering a fresh build) after warning about the concrete reason.
     """
     if not os.path.exists(path):
         return None
     with open(path, "rb") as f:
         cache = pickle.load(f)
-    if cache.get("_n_docs") != n_docs:
+    cached = cache.get("_signature")
+    if cached is None:
+        # Caches written before the config signature existed cannot be
+        # validated (min_df / max_features / graph_mode / corpus content are
+        # unknown), and accepting them is exactly how a stale vocabulary used
+        # to slip through.  Rebuild once; the new cache carries a signature.
         warnings.warn(
-            f"[EdgeCache] Corpus size changed ({cache['_n_docs']} → {n_docs}). "
-            "Ignoring stale cache and rebuilding."
+            f"[EdgeCache] '{path}' predates the config-signature check and "
+            "cannot be validated; rebuilding it once. Subsequent runs will "
+            "reuse it.",
+            stacklevel=2,
         )
         return None
-    print(f"  [EdgeCache] Loaded from '{path}' — skipping spaCy parsing.")
+    reasons = _signature_diff(cached, signature)
+    if reasons:
+        warnings.warn(
+            f"[EdgeCache] Cache invalidated — {'; '.join(reasons)}. Rebuilding.",
+            stacklevel=2,
+        )
+        return None
+    print(f"  [EdgeCache] Loaded from '{path}' — skipping lemmatisation/parsing.")
     return cache
 
 
@@ -497,14 +701,23 @@ def build_hetero_graph(
         keywords.extract_separated_topics for graph-based MWE extraction.
     """
     graph_mode = cfg.graph_mode
-    assert graph_mode in GRAPH_MODES
+    if graph_mode not in GRAPH_MODES:
+        raise ValueError(
+            f"graph_mode must be one of {list(GRAPH_MODES)}, got '{graph_mode}'"
+        )
 
     print(f"\n[Graph] Mode: '{graph_mode}' — {GRAPH_MODES[graph_mode]}")
+
+    # Cache signature: the cached artifacts depend on the corpus content and on
+    # several config fields (lemmatiser, graph_mode, min_df, max_features, lang);
+    # all of them must match for a cache hit, otherwise a stale vocabulary could
+    # be reused silently.
+    cache_signature = _cache_signature(cfg, documents)
 
     # ---- Try loading pre-cached parse results ----
     _cache = None
     if edge_cache_path is not None:
-        _cache = _load_parse_cache(edge_cache_path, len(documents))
+        _cache = _load_parse_cache(edge_cache_path, cache_signature)
 
     if _cache is not None:
         # Cache hit: restore vocabulary and (conditionally) edge lists
@@ -533,8 +746,8 @@ def build_hetero_graph(
         # ---- 1. Build vocabulary on lemmas ----
         print("1/5  Building lemma vocabulary...")
         lemma_docs = []
-        for text in tqdm(documents, desc="Lemmatisation"):
-            doc = nlp_model(text)
+        parsed_docs = _iter_parsed(nlp_model, documents)
+        for doc in tqdm(parsed_docs, total=len(documents), desc="Lemmatisation"):
             lemmas = [
                 t.lemma_.lower()
                 for t in doc
@@ -542,15 +755,16 @@ def build_hetero_graph(
             ]
             lemma_docs.append(" ".join(lemmas))
 
-        # stop_words=None: spaCy already filtered stop words during lemmatisation
-        # (t.is_stop guard above). Passing the raw spaCy list to CountVectorizer
-        # triggers sklearn warnings for Italian because lemmatised stop-word forms
-        # ("gl", "nient") don't match the original list entries.
+        # stop_words=None: the lemmatiser already filtered stop words during
+        # parsing (t.is_stop guard above). Passing the raw list to
+        # CountVectorizer triggers sklearn warnings for Italian because
+        # lemmatised stop-word forms ("gl", "nient") don't match the original
+        # list entries.
         vectorizer = CountVectorizer(
             stop_words=None,
             min_df=cfg.min_df,
             max_features=cfg.max_features,
-            token_pattern=r"(?u)\b[a-zA-Z][a-zA-Z]+\b",
+            token_pattern=VOCAB_TOKEN_PATTERN,
         )
         bow_sparse = vectorizer.fit_transform(lemma_docs)
         vocab_arr  = vectorizer.get_feature_names_out()
@@ -581,7 +795,7 @@ def build_hetero_graph(
         data["doc", "contains", "word"].edge_index     = torch.empty((2, 0), dtype=torch.long)
         data["word", "rev_contains", "doc"].edge_index = torch.empty((2, 0), dtype=torch.long)
         data["word", "relates", "word"].edge_index     = torch.empty((2, 0), dtype=torch.long)
-        # Cache vocab/bow/embeddings so future runs skip spaCy + SBERT entirely.
+        # Cache vocab/bow/embeddings so future runs skip the NLP parse + SBERT entirely.
         # IMPORTANT: preserve any existing edge lists in the cache — a "none"-mode
         # run must not overwrite real edges built by a prior "filtered"/"full_dep" run.
         if edge_cache_path is not None:
@@ -602,6 +816,7 @@ def build_hetero_graph(
                     doc_embs=doc_embs,
                     word_embs_static=word_embs_none,
                     dep_triples=_dep_triples,
+                    signature=cache_signature,
                 )
         return (
             data, vocab_arr.tolist(), bow_sparse, 0, 0,
@@ -631,8 +846,10 @@ def build_hetero_graph(
         # surface n-grams.
         dep_triple_counts: dict = defaultdict(int)
 
-        for d_idx, text in enumerate(tqdm(documents, desc="Dependency parsing")):
-            doc = nlp_model(text)
+        parsing_docs = _iter_parsed(nlp_model, documents)
+        for d_idx, doc in enumerate(
+            tqdm(parsing_docs, total=len(documents), desc="Dependency parsing")
+        ):
             for token in doc:
                 if token.is_stop or not token.is_alpha or len(token.lemma_) <= 2:
                     continue
@@ -692,6 +909,7 @@ def build_hetero_graph(
                 doc_embs=doc_embs,
                 word_embs_static=word_embs_static,
                 dep_triples=dep_triples,
+                signature=cache_signature,
             )
 
     # ---- 4b. PMI sparsification of word-word edges ----
@@ -729,3 +947,96 @@ def build_hetero_graph(
     print(f"  Doc-word edges : {n_dw:,}")
     print(f"  Word-word edges: {n_ww:,}")
     return data, vocab_arr.tolist(), bow_sparse, n_dw, n_ww, dep_triples
+
+
+# ---------------------------------------------------------------------------
+# Control condition for the syntax ablation
+# ---------------------------------------------------------------------------
+#
+# The claim "syntactic edges contribute" needs a control with the same graph
+# statistics but no linguistic content.  Apply either helper to the syntactic
+# edge lists *before* graph construction to obtain that control:
+#
+#     ctrl_src, ctrl_dst = rewire_word_word_edges(
+#         word_word_src, word_word_dst, n_vocab, seed=0, mode="swap"
+#     )
+#     # then build the graph from ctrl_src / ctrl_dst instead
+#
+# Two modes, two different null hypotheses:
+#
+# * "swap"    — 2-edge swap randomisation: every word keeps exactly its degree,
+#               the edge count is unchanged, only the topology is destroyed.
+#               Asks "is it the *content* of the edges, or just more
+#               regularisation?"
+# * "permute" — node relabelling: the same graph attached to the wrong words.
+#               Asks "is it the *pairing with words*, or any smoothing at all?"
+
+
+def rewire_word_word_edges(
+    word_word_src: list,
+    word_word_dst: list,
+    n_vocab: int,
+    seed: int = 0,
+    mode: str = "swap",
+    n_swaps: Optional[int] = None,
+) -> Tuple[list, list]:
+    """
+    Return a control version of the syntactic edge lists.
+
+    Parameters
+    ----------
+    mode : "swap" | "permute"
+        "swap" preserves each word's degree exactly (2-edge swap
+        randomisation); "permute" relabels the nodes, preserving every graph
+        statistic but destroying the word correspondence.
+    n_swaps : int, optional
+        Number of swap attempts; defaults to ``10 * n_edges``.
+
+    Returns
+    -------
+    (src, dst) : new edge lists of the same length as the input (``permute``)
+        or with the same degree sequence (``swap``).
+    """
+    if mode not in ("swap", "permute"):
+        raise ValueError(f"mode must be 'swap' or 'permute', got '{mode}'")
+    if not word_word_src:
+        return list(word_word_src), list(word_word_dst)
+
+    rng = np.random.default_rng(seed)
+    src = [int(x) for x in word_word_src]
+    dst = [int(x) for x in word_word_dst]
+
+    if mode == "permute":
+        perm = rng.permutation(int(n_vocab))
+        return [int(perm[s]) for s in src], [int(perm[d]) for d in dst]
+
+    # Self-loops are kept untouched (dropping them would change the degree
+    # sequence, which is exactly what this control must preserve).
+    edges = [(s, d) for s, d in zip(src, dst)]
+    present = {(min(a, b), max(a, b)) for a, b in edges if a != b}
+    swaps = 10 * len(edges) if n_swaps is None else int(n_swaps)
+
+    for _ in range(swaps):
+        i, j = rng.integers(0, len(edges), size=2)
+        if i == j:
+            continue
+        u, v = edges[i]
+        x, y = edges[j]
+        if u == v or x == y:            # leave self-loops alone
+            continue
+        if len({u, v, x, y}) < 4:
+            continue
+        if u == y or x == v:
+            continue
+        key_i = (min(u, y), max(u, y))
+        key_j = (min(x, v), max(x, v))
+        if key_i == key_j or key_i in present or key_j in present:
+            continue
+        present.discard((min(u, v), max(u, v)))
+        present.discard((min(x, y), max(x, y)))
+        present.add(key_i)
+        present.add(key_j)
+        edges[i] = (u, y)
+        edges[j] = (x, v)
+
+    return [int(a) for a, _ in edges], [int(b) for _, b in edges]

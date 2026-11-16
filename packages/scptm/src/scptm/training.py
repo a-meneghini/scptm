@@ -37,6 +37,7 @@ Design notes
 """
 
 import math
+import warnings
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -45,6 +46,8 @@ import torch.nn.functional as F
 from torch_geometric.data import HeteroData
 from torch_geometric.loader import NeighborLoader
 from tqdm import tqdm
+
+from .config import neighbor_sampling_available
 
 
 # ---------------------------------------------------------------------------
@@ -281,8 +284,20 @@ def train(
         print("  Pre-computing PPMI matrix for coherence loss...")
         ppmi_tensor = compute_ppmi_tensor(bow_csr, device)
 
-    # Build NeighborLoader once if requested
+    # Build NeighborLoader once if requested.
+    # NeighborLoader only raises ImportError when the first batch is sampled, so
+    # check availability up front and fall back to full-batch instead of
+    # crashing mid-epoch on machines without pyg-lib / torch-sparse.
     use_loader = cfg.use_neighbor_sampling and cfg.graph_mode != "none"
+    if use_loader and not neighbor_sampling_available():
+        warnings.warn(
+            "[SCPTM] use_neighbor_sampling=True requires either 'pyg-lib' or "
+            "'torch-sparse', and neither is installed. Falling back to "
+            "full-batch GNN training; on very large graphs this may exhaust "
+            "memory.",
+            stacklevel=2,
+        )
+        use_loader = False
     loader = None
     if use_loader:
         loader = NeighborLoader(

@@ -7,7 +7,7 @@ Public interface
 ----------------
 fit(source, source_type, ..., edge_cache_path=None) → self
     Full training pipeline:
-      1. NLP pipeline (SBERT + spaCy)
+      1. NLP pipeline (SBERT + lemmatiser/parser: spaCy or UDPipe)
       2. Corpus loading and optional chunking
       3. Heterogeneous graph construction (or cache load)
       4. Contextual embedding collection (or cache load)
@@ -49,6 +49,7 @@ run_ablation_study(documents, epochs, **kwargs) → DataFrame
 
 import pickle
 import warnings
+from dataclasses import replace
 from pathlib import Path
 from typing import List, Optional, Union
 
@@ -57,7 +58,12 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 
-from .config import GRAPH_MODES, SCPTMConfig
+from .config import (
+    GRAPH_MODES,
+    SCPTMConfig,
+    neighbor_sampling_available,
+    resolve_device,
+)
 from .evaluation import SCPTMEvaluator, interpret_mc_uncertainty
 from .graph import (
     build_hetero_graph,
@@ -101,7 +107,16 @@ class SCPTM:
     """
 
     def __init__(self, config: Optional[SCPTMConfig] = None, **kwargs):
-        self.config = config or SCPTMConfig(**kwargs)
+        # Previously `config or SCPTMConfig(**kwargs)` silently discarded every
+        # keyword argument as soon as a config object was passed, so
+        # SCPTM(config=cfg, num_topics=25) ran with cfg.num_topics and no
+        # warning.  Passing both is ambiguous: fail loudly instead.
+        if config is not None and kwargs:
+            raise TypeError(
+                "Pass either config= or individual keyword arguments, not both "
+                f"(got config and {sorted(kwargs)})."
+            )
+        self.config = config if config is not None else SCPTMConfig(**kwargs)
         self._is_fitted: bool = False
 
         # State filled during fit()
@@ -157,9 +172,14 @@ class SCPTM:
         refinement_blend : float
             Alpha in:  emb_refined = (1-alpha)*emb_orig + alpha*centroid
         edge_cache_path : str | None
-            Path to a parse cache file. If the file exists the spaCy parsing
-            steps are skipped on load. If it doesn't exist, it is created
-            after the first parse so subsequent runs are fast.
+            Path to a parse cache file. If the file exists the lemmatisation /
+            parsing steps are skipped on load. If it doesn't exist, it is
+            created after the first parse so subsequent runs are fast.  The
+            cache is keyed on a signature that includes a hash of the corpus
+            text plus ``lang``, ``lemmatizer``, ``graph_mode``, ``min_df`` and
+            ``max_features``; whenever any of these changes the cache is
+            rebuilt automatically (with a warning naming the changed field),
+            so a stale vocabulary can never be reused silently.
         covariate : array-like of shape (n_docs,) or None
             Per-document covariate for STM-style prevalence conditioning.
             Numeric values are z-standardised; string/categorical values are
@@ -172,7 +192,7 @@ class SCPTM:
         """
         cfg = self.config
 
-        # ---- 0. Seed torch's global RNG ----
+        # ---- 0. Device + seed torch's global RNG ----
         # random_state was previously only forwarded to sklearn (k-means init)
         # and UMAP — PyTorch's own RNG was never seeded, so GATConv/Linear
         # weight init, training.py's torch.randperm() batch shuffling, and
@@ -181,12 +201,27 @@ class SCPTM:
         # fit() calls with the same random_state produced different theta
         # (verified: max abs diff ~0.06 on a toy corpus) despite the
         # parameter's name and docstring implying reproducibility.
+        #
+        # The device is resolved here (rather than after graph construction)
+        # so the SBERT encoder, the seed calls and the neighbor-sampling guard
+        # all agree on the same backend.
+        self._device = resolve_device(getattr(cfg, "device", "auto"))
         torch.manual_seed(cfg.random_state)
-        if torch.cuda.is_available():
+        if self._device.type == "cuda":
             torch.cuda.manual_seed_all(cfg.random_state)
+        elif self._device.type == "mps" and hasattr(torch, "mps"):
+            # torch.manual_seed() does not cover the Metal generator on every
+            # supported torch version, so seed it explicitly for reproducibility.
+            torch.mps.manual_seed(cfg.random_state)
 
         # ---- 1. NLP pipeline ----
-        self._sbert, self._nlp, self._stop = setup_nlp_pipeline(cfg.lang)
+        self._sbert, self._nlp, self._stop = setup_nlp_pipeline(
+            cfg.lang,
+            lemmatizer=getattr(cfg, "lemmatizer", "spacy"),
+            udpipe_model_path=getattr(cfg, "udpipe_model_path", None),
+            udpipe_cache_dir=getattr(cfg, "udpipe_cache_dir", None),
+            device=getattr(cfg, "device", "auto"),
+        )
 
         # ---- 2. Corpus (with doc_indices for covariate alignment) ----
         self._corpus, self._doc_indices = prepare_corpus(
@@ -210,36 +245,88 @@ class SCPTM:
         emb_dim = self._graph_data["doc"].x.shape[1]
         estimate_graph_memory(len(self._corpus), len(self._vocab), n_dw, n_ww, emb_dim)
 
-        # ---- 3b. Auto-enable neighbor sampling on large graphs ----
+        # ---- 3b. Neighbour sampling (auto-enable on large graphs) ----
         # 2*n_dw accounts for "contains" + its "rev_contains" mirror (both
         # process n_dw edges through their own GATConv); neither is capped
         # by pmi_sparse_graph, which only sparsifies "relates" (n_ww).
         effective_edges = 2 * n_dw + n_ww
-        if (
-            cfg.graph_mode != "none"
-            and not cfg.use_neighbor_sampling
-            and effective_edges > cfg.neighbor_sampling_edge_threshold
-        ):
+
+        # The effective flag lives in a local variable and is applied to a COPY
+        # of the config, so fit() never mutates the config object the caller
+        # owns.  (It used to flip cfg.use_neighbor_sampling in place, and that
+        # mutated value was then pickled into model.save().)
+        use_sampling = bool(cfg.use_neighbor_sampling)
+
+        # NeighborLoader imports fine without pyg-lib/torch-sparse and only
+        # raises ImportError when the first batch is sampled, so check up front
+        # and degrade to full-batch instead of crashing mid-epoch.
+        blocker = None
+        if self._device.type == "mps":
+            blocker = (
+                "it is not supported on MPS (pyg-lib/torch-sparse are CPU/CUDA "
+                "only)"
+            )
+        elif not neighbor_sampling_available():
+            blocker = (
+                "neither 'pyg-lib' nor 'torch-sparse' is installed, and "
+                "NeighborLoader raises ImportError without one of them"
+            )
+
+        already_warned = False
+        if use_sampling and blocker:
             warnings.warn(
-                f"[SCPTM] Graph has {effective_edges:,} effective edges "
-                f"(doc-word counted twice for the contains/rev_contains "
-                f"pair, plus word-word), above the "
-                f"neighbor_sampling_edge_threshold "
-                f"({cfg.neighbor_sampling_edge_threshold:,}). "
-                f"Auto-enabling use_neighbor_sampling=True to avoid "
-                f"materialising the full adjacency on GPU at once — this "
-                f"is the same fix previously needed ad hoc for large "
-                f"corpora (UN Debates, 10M+ edges) to prevent OOM. "
-                f"Set use_neighbor_sampling=True explicitly to silence "
-                f"this warning, or raise "
-                f"neighbor_sampling_edge_threshold in SCPTMConfig if you "
-                f"have GPU memory to spare and want the full-batch GNN.",
+                f"[SCPTM] use_neighbor_sampling=True cannot run here: {blocker}. "
+                "Falling back to full-batch GNN training; on very large graphs "
+                "this may exhaust memory (use device='cpu'/'cuda' with "
+                "pyg-lib/torch-sparse if you need neighbour sampling).",
                 stacklevel=2,
             )
-            cfg.use_neighbor_sampling = True
+            use_sampling = False
+            already_warned = True
 
-        # ---- 4. Device ----
-        self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if (
+            cfg.graph_mode != "none"
+            and not use_sampling
+            and effective_edges > cfg.neighbor_sampling_edge_threshold
+        ):
+            if blocker:
+                if not already_warned:
+                    warnings.warn(
+                        f"[SCPTM] Graph has {effective_edges:,} effective edges, "
+                        f"above neighbor_sampling_edge_threshold "
+                        f"({cfg.neighbor_sampling_edge_threshold:,}), but "
+                        f"neighbour sampling is unavailable: {blocker}. "
+                        f"Proceeding with the full-batch GNN, which may exhaust "
+                        f"memory.",
+                        stacklevel=2,
+                    )
+            else:
+                warnings.warn(
+                    f"[SCPTM] Graph has {effective_edges:,} effective edges "
+                    f"(doc-word counted twice for the contains/rev_contains "
+                    f"pair, plus word-word), above the "
+                    f"neighbor_sampling_edge_threshold "
+                    f"({cfg.neighbor_sampling_edge_threshold:,}). "
+                    f"Auto-enabling use_neighbor_sampling=True to avoid "
+                    f"materialising the full adjacency on GPU at once — this "
+                    f"is the same fix previously needed ad hoc for large "
+                    f"corpora (UN Debates, 10M+ edges) to prevent OOM. "
+                    f"Set use_neighbor_sampling=True explicitly to silence "
+                    f"this warning, or raise "
+                    f"neighbor_sampling_edge_threshold in SCPTMConfig if you "
+                    f"have GPU memory to spare and want the full-batch GNN.",
+                    stacklevel=2,
+                )
+                use_sampling = True
+
+        # train() reads the flag from this config; self.config stays untouched.
+        train_cfg = (
+            replace(cfg, use_neighbor_sampling=use_sampling)
+            if use_sampling != cfg.use_neighbor_sampling
+            else cfg
+        )
+
+        # ---- 4. Move graph to device (device resolved in step 0) ----
         self._graph_data = self._graph_data.to(self._device)
         self._static_word_embs = self._graph_data["word"].x.clone().to(self._device)
 
@@ -247,19 +334,29 @@ class SCPTM:
         self._ctx_embs_list = None
         if edge_cache_path is not None:
             self._ctx_embs_list = load_ctx_embs_from_cache(
-                edge_cache_path, len(self._vocab)
+                edge_cache_path, len(self._vocab),
+                lemmatizer=getattr(cfg, "lemmatizer", "spacy"),
+                lang=cfg.lang,
+                max_occurrences=cfg.max_ctx_occurrences,
             )
         if self._ctx_embs_list is None:
+            # Reuse the document embeddings already computed for the graph
+            # instead of encoding the corpus a second time.
             _ctx_dict = collect_contextual_embeddings(
                 self._corpus, self._nlp, self._sbert, self._vocab_idx,
                 cfg.max_ctx_occurrences,
+                random_state=cfg.random_state,
+                doc_embeddings=self._graph_data["doc"].x.cpu().numpy(),
             )
             self._ctx_embs_list = [
                 _ctx_dict[w].to("cpu") if w in _ctx_dict else None
                 for w in self._vocab
             ]
             if edge_cache_path is not None:
-                save_ctx_embs_to_cache(edge_cache_path, self._ctx_embs_list)
+                save_ctx_embs_to_cache(
+                    edge_cache_path, self._ctx_embs_list,
+                    max_occurrences=cfg.max_ctx_occurrences,
+                )
 
         # ---- 5b. Covariate encoding ----
         self._covariate_tensor = None
@@ -333,13 +430,13 @@ class SCPTM:
         # ---- 7. Training (+ optional iterative refinement) ----
         if iterative_refinement and n_refinement_steps > 0:
             self._history = self._fit_with_refinement(
-                n_refinement_steps, refinement_blend
+                n_refinement_steps, refinement_blend, train_cfg
             )
         else:
             self._history = train(
                 self._graph_data, self._bow_sparse, self._nn,
                 self._ctx_embs_list, self._static_word_embs,
-                cfg, self._device,
+                train_cfg, self._device,
                 vocab=self._vocab,
                 covariate_tensor=self._covariate_tensor,
             )
@@ -413,7 +510,22 @@ class SCPTM:
         covariate=None,
         **fit_kwargs,
     ) -> torch.Tensor:
-        """Fit and return topic mixtures for training documents."""
+        """
+        Fit and return topic mixtures for training documents.
+
+        Returns
+        -------
+        torch.Tensor, shape (n_docs, K)
+
+        Notes
+        -----
+        This is scikit-learn's ``fit_transform`` convention, so the tensor is
+        the cell's value and a notebook will render its full repr.  When you do
+        not want that (or you only need the model), use the equivalent::
+
+            model.fit(documents, ...)   # returns self, renders nothing
+            theta = model.theta         # explicit accessor, shape (n_docs, K)
+        """
         self.fit(
             source, source_type=source_type, text_col=text_col,
             edge_cache_path=edge_cache_path,
@@ -469,6 +581,7 @@ class SCPTM:
         self,
         n_steps: int,
         blend: float,
+        train_cfg: Optional[SCPTMConfig] = None,
     ) -> dict:
         """
         TriTopic-inspired iterative refinement:
@@ -476,8 +589,13 @@ class SCPTM:
           2. Blend doc embeddings toward dominant topic centroid
           3. Re-train from current weights for cfg.epochs
           4. Repeat n_steps times
+
+        ``train_cfg`` is the effective config computed by :meth:`fit` (which may
+        differ from ``self.config`` in ``use_neighbor_sampling``); it is passed
+        so every refinement step trains exactly like the first one, without
+        mutating the caller's config.
         """
-        cfg = self.config
+        cfg = train_cfg if train_cfg is not None else self.config
         history = {"loss": [], "recon": [], "kl": [], "kl_weight": [],
                    "coherence_npmi": [], "topic_diversity": [], "metric_epochs": []}
 
@@ -689,12 +807,25 @@ class SCPTM:
             random_state=self.config.random_state,
         )
 
-    def visualize_2d(self, save_path: str = "semantic_space_2d.png"):
-        """High-resolution 2D UMAP plot for publications."""
+    def visualize_2d(
+        self,
+        save_path: str = "semantic_space_2d.png",
+        top_k: int = 5,
+        **kwargs,
+    ):
+        """
+        High-resolution 2D UMAP plot for publications.
+
+        Labels are laid out without overlaps (see
+        :func:`scptm.visualization.view_semantic_2d_paper`).  ``top_k`` words
+        and ``top_k`` MWEs are drawn per topic; ``adjust_labels=False``,
+        ``show_mwes=False``, ``min_dist=...``, ``cmap=...`` are forwarded.
+        """
         self._check_fitted()
         td, mwe_embs, mwe_vocab = extract_separated_topics(
             self._corpus, self._nn, self._vocab,
             self._static_word_embs, self._sbert, self._stop,
+            top_k=top_k,
             dep_triples=self._dep_triples,
         )
         view_semantic_2d_paper(
@@ -702,6 +833,7 @@ class SCPTM:
             mwe_embs, mwe_vocab, td,
             save_path=save_path,
             random_state=self.config.random_state,
+            **kwargs,
         )
 
     # ------------------------------------------------------------------
@@ -746,8 +878,15 @@ class SCPTM:
             state = pickle.load(f)
 
         model = cls(config=state["config"])
+        _cfg = state["config"]
         model._sbert, model._nlp, model._stop = setup_nlp_pipeline(
-            state["config"].lang, verbose=False
+            _cfg.lang,
+            verbose=False,
+            # getattr keeps models pickled before the UDPipe backend existed loadable
+            lemmatizer=getattr(_cfg, "lemmatizer", "spacy"),
+            udpipe_model_path=getattr(_cfg, "udpipe_model_path", None),
+            udpipe_cache_dir=getattr(_cfg, "udpipe_cache_dir", None),
+            device=getattr(_cfg, "device", "auto"),
         )
         model._vocab      = state["vocab"]
         model._vocab_idx  = {w: i for i, w in enumerate(state["vocab"])}
@@ -758,7 +897,7 @@ class SCPTM:
         model._theta_uncertainty = state["theta_uncertainty"]
         model._history    = state["history"]
 
-        model._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model._device = resolve_device(getattr(_cfg, "device", "auto"))
         emb_dim       = state["graph_doc_x"].shape[1]
 
         model._covariate_tensor = state.get("covariate_tensor")
@@ -1056,7 +1195,13 @@ class SCPTM:
 
     @property
     def theta(self) -> torch.Tensor:
-        """Document-topic mixtures, shape (n_docs, K)."""
+        """
+        Document-topic mixtures, shape (n_docs, K).
+
+        The same tensor :meth:`fit_transform` returns, but read explicitly — so
+        ``fit()`` + ``model.theta`` gives you theta without a notebook rendering
+        a large tensor repr at the end of the cell.
+        """
         self._check_fitted()
         return self._theta
 
